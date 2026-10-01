@@ -52,3 +52,6 @@ conf-stack-frame-size = []
 elf = "0.0.10"
 json = "0.12"
 test_utils = { path = "test_utils/" }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(sbpf_dump_interpreter)"] }
