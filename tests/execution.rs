@@ -2534,6 +2534,67 @@ fn test_tight_infinite_recursion() {
 }
 
 #[test]
+fn test_entrypoint_not_first() {
+    test_interpreter_and_jit_asm!(
+        "
+        function_foo:
+        mov64 r0, 3
+        exit
+        entrypoint:
+        call function_foo
+        add64 r0, 4
+        exit",
+        NO_INPUT,
+        TestContextObject::new(5),
+        ProgramResult::Ok(7),
+    );
+}
+
+#[test]
+fn test_nested_calls_return() {
+    // Calls return to the right place and leave the meter and the call depth as they were.
+    test_interpreter_and_jit_asm!(
+        "
+        mov64 r6, 30
+        loop:
+        call function_foo
+        sub64 r6, 1
+        jne r6, 0, loop
+        mov64 r0, 7
+        exit
+        function_foo:
+        call function_bar
+        exit
+        function_bar:
+        exit",
+        NO_INPUT,
+        TestContextObject::new(183),
+        ProgramResult::Ok(7),
+    );
+}
+
+#[test]
+fn test_err_call_depth_exceeded() {
+    let max_call_depth = Config::default().max_call_depth as u64;
+    for (budget, expected) in [
+        (3 * max_call_depth - 1, EbpfError::ExceededMaxInstructions),
+        (3 * max_call_depth, EbpfError::CallDepthExceeded),
+    ] {
+        test_interpreter_and_jit_asm!(
+            "
+            entrypoint:
+            add64 r10, 0
+            mov64 r3, 0x41414141
+            call entrypoint
+            exit",
+            NO_INPUT,
+            TestContextObject::new(budget),
+            ProgramResult::Err(expected),
+        );
+    }
+}
+
+#[test]
 fn test_tight_infinite_recursion_callx() {
     test_interpreter_and_jit_asm!(
         "
@@ -3896,6 +3957,89 @@ fn test_mod() {
         TestContextObject::new(4),
         ProgramResult::Err(EbpfError::DivideByZero),
     );
+}
+
+#[test]
+fn test_div_mod_full_width() {
+    // Both operands need all 64 bits: the divisor's low 32 bits are zero.
+    test_interpreter_and_jit_asm!(
+        "
+        mov64 r0, 1
+        lsh64 r0, 40
+        mov64 r1, 1
+        lsh64 r1, 33
+        div64 r0, r1
+        exit",
+        NO_INPUT,
+        TestContextObject::new(6),
+        ProgramResult::Ok(128),
+    );
+    test_interpreter_and_jit_asm!(
+        "
+        mov64 r0, 1
+        lsh64 r0, 40
+        add64 r0, 5
+        mov64 r1, 1
+        lsh64 r1, 33
+        mod64 r0, r1
+        exit",
+        NO_INPUT,
+        TestContextObject::new(7),
+        ProgramResult::Ok(5),
+    );
+}
+
+#[test]
+fn test_div_imm_extension() {
+    // The immediate is sign extended for 64-bit and truncated for 32-bit division.
+    test_interpreter_and_jit_asm!(
+        "
+        mov64 r0, -1
+        div64 r0, -1
+        mov64 r1, -1
+        div32 r1, -1
+        add64 r0, r1
+        exit",
+        NO_INPUT,
+        TestContextObject::new(6),
+        ProgramResult::Ok(2),
+    );
+}
+
+#[test]
+fn test_err_div_mod_by_zero_reg() {
+    for op in ["div64", "mod64", "div32", "mod32"] {
+        test_interpreter_and_jit_asm!(
+            &format!(
+                "
+                mov64 r0, 5
+                mov64 r1, 0
+                {} r0, r1
+                exit",
+                op
+            ),
+            NO_INPUT,
+            TestContextObject::new(3),
+            ProgramResult::Err(EbpfError::DivideByZero),
+        );
+    }
+    // Only the low 32 bits of the divisor are zero.
+    for op in ["div32", "mod32"] {
+        test_interpreter_and_jit_asm!(
+            &format!(
+                "
+                mov64 r0, 5
+                mov64 r1, 1
+                lsh64 r1, 32
+                {} r0, r1
+                exit",
+                op
+            ),
+            NO_INPUT,
+            TestContextObject::new(4),
+            ProgramResult::Err(EbpfError::DivideByZero),
+        );
+    }
 }
 
 #[test]
