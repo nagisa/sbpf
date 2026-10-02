@@ -2161,6 +2161,74 @@ fn test_callx() {
 }
 
 #[test]
+fn test_callx_unaligned_target() {
+    // The target is truncated to the instruction containing it.
+    test_interpreter_and_jit_asm!(
+        "
+        mov64 r0, 0x0
+        mov64 r8, 0x1
+        lsh64 r8, 0x20
+        or64 r8, 0x33
+        callx r8
+        exit
+        function_foo:
+        mov64 r0, 0x2A
+        exit",
+        NO_INPUT,
+        TestContextObject::new(8),
+        ProgramResult::Ok(42),
+    );
+}
+
+#[test]
+fn test_err_callx_oob_computed() {
+    // Just past the end of the program.
+    test_interpreter_and_jit_asm!(
+        "
+        mov64 r8, 0x1
+        lsh64 r8, 0x20
+        or64 r8, 0x28
+        callx r8
+        exit",
+        NO_INPUT,
+        TestContextObject::new(4),
+        ProgramResult::Err(EbpfError::CallOutsideTextSegment),
+    );
+    // Just before the start of the program.
+    test_interpreter_and_jit_asm!(
+        "
+        mov64 r8, 0x1
+        lsh64 r8, 0x20
+        sub64 r8, 0x1
+        callx r8
+        exit",
+        NO_INPUT,
+        TestContextObject::new(4),
+        ProgramResult::Err(EbpfError::CallOutsideTextSegment),
+    );
+}
+
+#[test]
+fn test_err_callx_depth_exceeded() {
+    let max_call_depth = Config::default().max_call_depth as u64;
+    for (budget, expected) in [
+        (3 * max_call_depth - 1, EbpfError::ExceededMaxInstructions),
+        (3 * max_call_depth, EbpfError::CallDepthExceeded),
+    ] {
+        test_interpreter_and_jit_asm!(
+            "
+            mov64 r8, 0x1
+            lsh64 r8, 0x20
+            callx r8
+            exit",
+            NO_INPUT,
+            TestContextObject::new(budget),
+            ProgramResult::Err(expected),
+        );
+    }
+}
+
+#[test]
 fn test_err_callx_oob_low() {
     let config = Config {
         enabled_sbpf_versions: SBPFVersion::V0..=SBPFVersion::V0,
