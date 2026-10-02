@@ -1197,6 +1197,70 @@ fn test_err_ldxdw_nomem() {
 }
 
 #[test]
+fn test_err_ldxdw_nomem_capped() {
+    // The access violation would only be detected after running out of budget.
+    test_interpreter_and_jit_asm!(
+        "
+        mov64 r0, 0x0
+        ldxdw r0, [r1+6]
+        exit",
+        NO_INPUT,
+        TestContextObject::new(1),
+        ProgramResult::Err(EbpfError::ExceededMaxInstructions),
+    );
+}
+
+#[test]
+fn test_memory_access_preserves_registers() {
+    test_interpreter_and_jit_asm!(
+        "
+        mov64 r0, 0x1
+        mov64 r1, 0x2
+        mov64 r2, 0x4
+        mov64 r3, 0x8
+        mov64 r4, 0x10
+        mov64 r5, 0x20
+        mov64 r6, 0x40
+        mov64 r7, 0x80
+        mov64 r8, 0x100
+        mov64 r9, 0x200
+        stxdw [r10-8], r9
+        stdw [r10-16], 0x400
+        ldxdw r9, [r10-8]
+        ldxdw r9, [r10-16]
+        add64 r0, r1
+        add64 r0, r2
+        add64 r0, r3
+        add64 r0, r4
+        add64 r0, r5
+        add64 r0, r6
+        add64 r0, r7
+        add64 r0, r8
+        add64 r0, r9
+        exit",
+        NO_INPUT,
+        TestContextObject::new(24),
+        ProgramResult::Ok(0x5ff),
+    );
+}
+
+#[test]
+fn test_store_imm_truncation() {
+    test_interpreter_and_jit_asm!(
+        "
+        stdw [r10-8], -1
+        stw [r10-8], 0x12345678
+        sth [r10-8], -2
+        stb [r10-8], 0x7f
+        ldxdw r0, [r10-8]
+        exit",
+        NO_INPUT,
+        TestContextObject::new(6),
+        ProgramResult::Ok(0xffffffff1234ff7f),
+    );
+}
+
+#[test]
 fn test_ldxb_all() {
     let input = [
         0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, //
@@ -2441,6 +2505,170 @@ fn test_syscall() {
         ),
         TestContextObject::new(9),
         ProgramResult::Ok(0),
+    );
+}
+
+struct SyscallErr;
+
+impl BuiltinFunctionDefinition<TestContextObject> for SyscallErr {
+    type Error = Box<dyn std::error::Error>;
+
+    fn rust(
+        _: &mut TestContextObject,
+        _: u64,
+        _: u64,
+        _: u64,
+        _: u64,
+        _: u64,
+    ) -> Result<u64, Self::Error> {
+        Err(Box::new(EbpfError::DivideByZero))
+    }
+}
+
+/// Expects the arguments `1, 2, 4, 8, 16`, overwrites every register a host function is allowed to
+/// clobber and returns `0x400`.
+struct SyscallClobber;
+
+impl BuiltinFunctionDefinition<TestContextObject> for SyscallClobber {
+    type Error = Box<dyn std::error::Error>;
+
+    fn rust(
+        _: &mut TestContextObject,
+        a: u64,
+        b: u64,
+        c: u64,
+        d: u64,
+        e: u64,
+    ) -> Result<u64, Self::Error> {
+        if (a, b, c, d, e) != (1, 2, 4, 8, 16) {
+            return Err(format!("unexpected arguments {:?}", (a, b, c, d, e)).into());
+        }
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::asm!(
+                "mov rax, -1",
+                "mov rcx, -1",
+                "mov rdx, -1",
+                "mov rsi, -1",
+                "mov rdi, -1",
+                "mov r8, -1",
+                "mov r9, -1",
+                "mov r10, -1",
+                "mov r11, -1",
+                "mov r12, -1",
+                "mov r13, -1",
+                "mov r14, -1",
+                "mov r15, -1",
+                out("rax") _,
+                out("rcx") _,
+                out("rdx") _,
+                out("rsi") _,
+                out("rdi") _,
+                out("r8") _,
+                out("r9") _,
+                out("r10") _,
+                out("r11") _,
+                out("r12") _,
+                out("r13") _,
+                out("r14") _,
+                out("r15") _,
+            );
+        }
+        Ok(0x400)
+    }
+}
+
+#[test]
+fn test_err_syscall_error() {
+    test_syscall_asm!(
+        "
+        mov64 r0, 0x7
+        syscall bpf_syscall_err
+        mov64 r0, 0x0
+        exit",
+        NO_INPUT,
+        (
+            "bpf_syscall_err" => SyscallErr,
+        ),
+        TestContextObject::new(2),
+        ProgramResult::Err(EbpfError::SyscallError(Box::new(EbpfError::DivideByZero))),
+    );
+}
+
+#[test]
+fn test_syscall_preserves_registers() {
+    test_syscall_asm!(
+        "
+        mov64 r1, 0x1
+        mov64 r2, 0x2
+        mov64 r3, 0x4
+        mov64 r4, 0x8
+        mov64 r5, 0x10
+        mov64 r6, 0x20
+        mov64 r7, 0x40
+        mov64 r8, 0x80
+        mov64 r9, 0x100
+        mov64 r0, 0x200
+        syscall bpf_syscall_clobber
+        add64 r0, r1
+        add64 r0, r2
+        add64 r0, r3
+        add64 r0, r4
+        add64 r0, r5
+        add64 r0, r6
+        add64 r0, r7
+        add64 r0, r8
+        add64 r0, r9
+        add64 r0, r10
+        exit",
+        NO_INPUT,
+        (
+            "bpf_syscall_clobber" => SyscallClobber,
+        ),
+        TestContextObject::new(22),
+        ProgramResult::Ok(0x5ff + ebpf::MM_STACK_START + 0x1000),
+    );
+}
+
+#[test]
+fn test_syscall_in_internal_call() {
+    test_syscall_asm!(
+        "
+        mov r1, 1
+        call function_foo
+        add64 r0, 1
+        exit
+        function_foo:
+        mov r2, 2
+        mov r3, 3
+        mov r4, 4
+        mov r5, 5
+        syscall bpf_gather_bytes
+        exit",
+        NO_INPUT,
+        (
+            "bpf_gather_bytes" => syscalls::SyscallGatherBytes,
+        ),
+        TestContextObject::new(10),
+        ProgramResult::Ok(0x0102030406),
+    );
+}
+
+#[test]
+fn test_err_syscall_error_capped() {
+    // The meter is checked before the syscall.
+    test_syscall_asm!(
+        "
+        mov64 r0, 0x7
+        mov64 r0, 0x7
+        syscall bpf_syscall_err
+        exit",
+        NO_INPUT,
+        (
+            "bpf_syscall_err" => SyscallErr,
+        ),
+        TestContextObject::new(2),
+        ProgramResult::Err(EbpfError::ExceededMaxInstructions),
     );
 }
 
