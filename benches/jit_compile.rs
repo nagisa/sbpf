@@ -53,7 +53,10 @@ fn bench_jit_compile(bencher: &mut Bencher) {
             .unwrap();
     executable.verify::<RequisiteVerifier>().unwrap();
     bencher.iter(|| executable.jit_compile().unwrap());
-    bencher.bytes = executable.get_compiled_program().unwrap().machine_code_length() as u64;
+    bencher.bytes = executable
+        .get_compiled_program()
+        .unwrap()
+        .machine_code_length() as u64;
 }
 
 #[cfg(all(feature = "jit", not(target_os = "windows"), target_arch = "x86_64"))]
@@ -67,7 +70,10 @@ fn bench_jit_compile_sbpfv3(bencher: &mut Bencher) {
             .unwrap();
     executable.verify::<RequisiteVerifier>().unwrap();
     bencher.iter(|| executable.jit_compile().unwrap());
-    bencher.bytes = executable.get_compiled_program().unwrap().machine_code_length() as u64;
+    bencher.bytes = executable
+        .get_compiled_program()
+        .unwrap()
+        .machine_code_length() as u64;
 }
 
 /// The text section of an SBPFv3 program, repeated `repeat` times.
@@ -148,7 +154,10 @@ fn bench_jit_compile_impl(bencher: &mut Bencher, text: Vec<u8>) {
     )
     .unwrap();
     bencher.iter(|| executable.jit_compile().unwrap());
-    bencher.bytes = executable.get_compiled_program().unwrap().machine_code_length() as u64;
+    bencher.bytes = executable
+        .get_compiled_program()
+        .unwrap()
+        .machine_code_length() as u64;
 }
 
 #[cfg(all(feature = "jit", not(target_os = "windows"), target_arch = "x86_64"))]
