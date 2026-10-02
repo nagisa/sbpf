@@ -3709,6 +3709,162 @@ fn test_lddw() {
 }
 
 #[test]
+fn test_lddw_value() {
+    for (value, expected) in [
+        ("0x1122334455667788", 0x1122334455667788u64),
+        // Neither half is sign extended.
+        ("0x80000000ffffffff", 0x80000000ffffffff),
+        ("0xffffffff", 0xffffffff),
+    ] {
+        test_interpreter_and_jit_asm!(
+            &format!(
+                "
+                lddw r0, {}
+                exit",
+                value
+            ),
+            NO_INPUT,
+            TestContextObject::new(2),
+            ProgramResult::Ok(expected),
+        );
+    }
+}
+
+#[test]
+fn test_lddw_meter() {
+    // Each `lddw` counts as a single instruction.
+    for (budget, expected) in [
+        (4, ProgramResult::Ok(3)),
+        (3, ProgramResult::Err(EbpfError::ExceededMaxInstructions)),
+    ] {
+        test_interpreter_and_jit_asm!(
+            "
+            lddw r1, 0x1
+            lddw r0, 0x2
+            add64 r0, r1
+            exit",
+            NO_INPUT,
+            TestContextObject::new(budget),
+            expected,
+        );
+    }
+}
+
+#[test]
+fn test_lddw_jump_over() {
+    test_interpreter_and_jit_asm!(
+        "
+        mov64 r0, 0x1
+        ja +2
+        lddw r0, 0x2
+        exit",
+        NO_INPUT,
+        TestContextObject::new(3),
+        ProgramResult::Ok(1),
+    );
+}
+
+#[test]
+fn test_lddw_call_target() {
+    test_interpreter_and_jit_asm!(
+        "
+        call function_foo
+        exit
+        function_foo:
+        lddw r0, 0x100000002
+        exit",
+        NO_INPUT,
+        TestContextObject::new(4),
+        ProgramResult::Ok(0x100000002),
+    );
+}
+
+#[test]
+fn test_err_callx_into_lddw() {
+    // The second half of `lddw` is at pc 5.
+    test_interpreter_and_jit_asm!(
+        "
+        mov64 r8, 0x1
+        lsh64 r8, 0x20
+        or64 r8, 0x28
+        callx r8
+        lddw r0, 0x1
+        exit",
+        NO_INPUT,
+        TestContextObject::new(5),
+        ProgramResult::Err(EbpfError::UnsupportedInstruction),
+    );
+}
+
+#[test]
+fn test_le() {
+    let config = Config {
+        enabled_sbpf_versions: SBPFVersion::V0..=SBPFVersion::V0,
+        ..Config::default()
+    };
+    let input = [0x22, 0x11];
+    test_interpreter_and_jit_asm!(
+        "
+        add64 r10, 0
+        ldxh r0, [r1]
+        le16 r0
+        exit",
+        config.clone(),
+        &raw const input,
+        TestContextObject::new(4),
+        ProgramResult::Ok(0x1122),
+    );
+    let input = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+    test_interpreter_and_jit_asm!(
+        "
+        add64 r10, 0
+        ldxdw r0, [r1]
+        le16 r0
+        exit",
+        config.clone(),
+        &raw const input,
+        TestContextObject::new(4),
+        ProgramResult::Ok(0x2211),
+    );
+    let input = [0x44, 0x33, 0x22, 0x11];
+    test_interpreter_and_jit_asm!(
+        "
+        add64 r10, 0
+        ldxw r0, [r1]
+        le32 r0
+        exit",
+        config.clone(),
+        &raw const input,
+        TestContextObject::new(4),
+        ProgramResult::Ok(0x11223344),
+    );
+    let input = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+    test_interpreter_and_jit_asm!(
+        "
+        add64 r10, 0
+        ldxdw r0, [r1]
+        le32 r0
+        exit",
+        config.clone(),
+        &raw const input,
+        TestContextObject::new(4),
+        ProgramResult::Ok(0x44332211),
+    );
+    let input = [0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11];
+    test_interpreter_and_jit_asm!(
+        "
+        add64 r10, 0
+        ldxdw r0, [r1]
+        le64 r0
+        exit",
+        config,
+        &raw const input,
+        TestContextObject::new(4),
+        ProgramResult::Ok(0x1122334455667788),
+    );
+}
+
+#[test]
 fn test_neg() {
     let config = Config {
         enabled_sbpf_versions: SBPFVersion::V0..=SBPFVersion::V0,
