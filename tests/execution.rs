@@ -1666,6 +1666,25 @@ fn test_ja() {
 }
 
 #[test]
+fn test_alu64_imm_sign_extension() {
+    test_interpreter_and_jit_asm!(
+        "
+        mov64 r0, 0
+        or64 r0, -1
+        mov64 r1, -1
+        and64 r1, -2
+        mov64 r2, 0
+        xor64 r2, -4
+        add64 r0, r1
+        add64 r0, r2
+        exit",
+        NO_INPUT,
+        TestContextObject::new(9),
+        ProgramResult::Ok(-7i64 as u64),
+    );
+}
+
+#[test]
 fn test_conditional_jumps() {
     const THEN: u32 = 0x5448454E;
     const ELSE: u32 = 0x454C5345;
@@ -1700,6 +1719,10 @@ fn test_conditional_jumps() {
         (ebpf::BPF_JLE, 7, 3, ELSE),
         (ebpf::BPF_JSET, 3, 7, THEN),
         (ebpf::BPF_JSET, 2, 4, ELSE),
+        (ebpf::BPF_JSET, 3, 3, THEN),
+        (ebpf::BPF_JSET, 4, 3, ELSE),
+        (ebpf::BPF_JSET, 6, 4, THEN),
+        (ebpf::BPF_JSET, -8, 7, ELSE),
         (ebpf::BPF_JNE, 3, 7, THEN),
         (ebpf::BPF_JNE, 3, 3, ELSE),
         (ebpf::BPF_JSGT, -3, -7, THEN),
