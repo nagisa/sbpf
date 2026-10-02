@@ -9,7 +9,12 @@
 extern crate solana_sbpf;
 extern crate test;
 
-use solana_sbpf::{elf::Executable, program::BuiltinProgram, verifier::RequisiteVerifier};
+use solana_sbpf::{
+    elf::Executable,
+    program::{BuiltinProgram, FunctionRegistry, SBPFVersion},
+    verifier::RequisiteVerifier,
+    vm::Config,
+};
 use std::{fs::File, io::Read, sync::Arc};
 use test::Bencher;
 use test_utils::{create_vm, TestContextObject};
@@ -48,4 +53,118 @@ fn bench_jit_compile(bencher: &mut Bencher) {
             .unwrap();
     executable.verify::<RequisiteVerifier>().unwrap();
     bencher.iter(|| executable.jit_compile().unwrap());
+    bencher.bytes = executable.get_compiled_program().unwrap().machine_code_length() as u64;
+}
+
+#[cfg(all(feature = "jit", not(target_os = "windows"), target_arch = "x86_64"))]
+#[bench]
+fn bench_jit_compile_sbpfv3(bencher: &mut Bencher) {
+    let mut file = File::open("tests/elfs/relative_call.so").unwrap();
+    let mut elf = Vec::new();
+    file.read_to_end(&mut elf).unwrap();
+    let executable =
+        Executable::<TestContextObject>::from_elf(&elf, Arc::new(BuiltinProgram::new_mock()))
+            .unwrap();
+    executable.verify::<RequisiteVerifier>().unwrap();
+    bencher.iter(|| executable.jit_compile().unwrap());
+    bencher.bytes = executable.get_compiled_program().unwrap().machine_code_length() as u64;
+}
+
+/// The text section of an SBPFv3 program, repeated `repeat` times.
+#[cfg(target_arch = "x86_64")]
+fn sbpfv3_text(repeat: usize) -> Vec<u8> {
+    let mut file = File::open("tests/elfs/relative_call.so").unwrap();
+    let mut elf = Vec::new();
+    file.read_to_end(&mut elf).unwrap();
+    let executable =
+        Executable::<TestContextObject>::from_elf(&elf, Arc::new(BuiltinProgram::new_mock()))
+            .unwrap();
+    executable.verify::<RequisiteVerifier>().unwrap();
+    // All the branches and calls are relative, so the copies are valid code too.
+    executable.get_text_bytes().1.repeat(repeat)
+}
+
+/// 10 MiB of BPF code consisting of `insn` alone.
+fn filled_text(insn: [u8; 8]) -> Vec<u8> {
+    insn.repeat(10 << 20 >> 3)
+}
+
+/// No machine code at all: `mov64 r1, r1`.
+const EMPTY_INSN: [u8; 8] = [0xbf, 0x11, 0, 0, 0, 0, 0, 0];
+/// The least machine code with a relocation: `mov32 r1, 1`.
+const SMALLEST_INSN: [u8; 8] = [0xb4, 0x01, 0, 0, 1, 0, 0, 0];
+/// The most machine code, with three kinds of relocations: `jsle64 r1, 1, -1`.
+const LARGEST_INSN: [u8; 8] = [0xd5, 0x01, 0xff, 0xff, 1, 0, 0, 0];
+
+#[cfg(target_arch = "x86_64")]
+fn bench_dynasm_jit_compile_impl(bencher: &mut Bencher, text: Vec<u8>) {
+    use solana_sbpf::codegen::x64::JIT_TEMPLATES;
+    // Exclude the template generation.
+    bencher.bytes = JIT_TEMPLATES.compile(&text, 0).text_section.len() as u64;
+    bencher.iter(|| JIT_TEMPLATES.compile(&text, 0));
+}
+
+#[cfg(target_arch = "x86_64")]
+#[bench]
+fn bench_dynasm_jit_compile(bencher: &mut Bencher) {
+    bench_dynasm_jit_compile_impl(bencher, sbpfv3_text(1));
+}
+
+#[cfg(target_arch = "x86_64")]
+#[bench]
+fn bench_dynasm_jit_compile_large(bencher: &mut Bencher) {
+    bench_dynasm_jit_compile_impl(bencher, sbpfv3_text(4096));
+}
+
+#[cfg(target_arch = "x86_64")]
+#[bench]
+fn bench_dynasm_jit_compile_10mib_empty(bencher: &mut Bencher) {
+    bench_dynasm_jit_compile_impl(bencher, filled_text(EMPTY_INSN));
+}
+
+#[cfg(target_arch = "x86_64")]
+#[bench]
+fn bench_dynasm_jit_compile_10mib_smallest(bencher: &mut Bencher) {
+    bench_dynasm_jit_compile_impl(bencher, filled_text(SMALLEST_INSN));
+}
+
+#[cfg(target_arch = "x86_64")]
+#[bench]
+fn bench_dynasm_jit_compile_10mib_largest(bencher: &mut Bencher) {
+    bench_dynasm_jit_compile_impl(bencher, filled_text(LARGEST_INSN));
+}
+
+#[cfg(all(feature = "jit", not(target_os = "windows"), target_arch = "x86_64"))]
+fn bench_jit_compile_impl(bencher: &mut Bencher, text: Vec<u8>) {
+    let config = Config {
+        noop_instruction_rate: 0,
+        ..Config::default()
+    };
+    let executable = Executable::<TestContextObject>::from_text_bytes(
+        &text,
+        Arc::new(BuiltinProgram::new_loader(config)),
+        SBPFVersion::V3,
+        FunctionRegistry::default(),
+    )
+    .unwrap();
+    bencher.iter(|| executable.jit_compile().unwrap());
+    bencher.bytes = executable.get_compiled_program().unwrap().machine_code_length() as u64;
+}
+
+#[cfg(all(feature = "jit", not(target_os = "windows"), target_arch = "x86_64"))]
+#[bench]
+fn bench_jit_compile_10mib_empty(bencher: &mut Bencher) {
+    bench_jit_compile_impl(bencher, filled_text(EMPTY_INSN));
+}
+
+#[cfg(all(feature = "jit", not(target_os = "windows"), target_arch = "x86_64"))]
+#[bench]
+fn bench_jit_compile_10mib_smallest(bencher: &mut Bencher) {
+    bench_jit_compile_impl(bencher, filled_text(SMALLEST_INSN));
+}
+
+#[cfg(all(feature = "jit", not(target_os = "windows"), target_arch = "x86_64"))]
+#[bench]
+fn bench_jit_compile_10mib_largest(bencher: &mut Bencher) {
+    bench_jit_compile_impl(bencher, filled_text(LARGEST_INSN));
 }

@@ -1685,6 +1685,34 @@ fn test_alu64_imm_sign_extension() {
 }
 
 #[test]
+fn test_noop_insertion() {
+    let config = Config {
+        noop_instruction_rate: 1,
+        ..Config::default()
+    };
+    // The no-ops are inserted at random.
+    for _ in 0..16 {
+        test_interpreter_and_jit_asm!(
+            "
+            mov64 r0, 0
+            mov64 r1, 0
+            lddw r2, 0x100000000
+            add64 r1, 1
+            call function_foo
+            jlt r1, 10, -3
+            exit
+            function_foo:
+            add64 r0, r2
+            exit",
+            config.clone(),
+            NO_INPUT,
+            TestContextObject::new(54),
+            ProgramResult::Ok(0xa00000000),
+        );
+    }
+}
+
+#[test]
 fn test_conditional_jumps() {
     const THEN: u32 = 0x5448454E;
     const ELSE: u32 = 0x454C5345;
