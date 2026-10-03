@@ -105,9 +105,10 @@ const LARGEST_INSN: [u8; 8] = [0xd5, 0x01, 0xff, 0xff, 1, 0, 0, 0];
 #[cfg(target_arch = "x86_64")]
 fn bench_dynasm_jit_compile_impl(bencher: &mut Bencher, text: Vec<u8>) {
     use solana_sbpf::codegen::x64::JIT_TEMPLATES;
+    let executable = sbpfv3_executable(&text);
     // Exclude the template generation.
-    bencher.bytes = JIT_TEMPLATES.compile(&text, 0).text_section.len() as u64;
-    bencher.iter(|| JIT_TEMPLATES.compile(&text, 0));
+    bencher.bytes = JIT_TEMPLATES.compile(&executable).text_section.len() as u64;
+    bencher.iter(|| JIT_TEMPLATES.compile(&executable));
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -140,19 +141,39 @@ fn bench_dynasm_jit_compile_10mib_largest(bencher: &mut Bencher) {
     bench_dynasm_jit_compile_impl(bencher, filled_text(LARGEST_INSN));
 }
 
-#[cfg(all(feature = "jit", not(target_os = "windows"), target_arch = "x86_64"))]
-fn bench_jit_compile_impl(bencher: &mut Bencher, text: Vec<u8>) {
+#[cfg(target_arch = "x86_64")]
+#[bench]
+fn bench_dynasm_jit_compile_10mib_random(bencher: &mut Bencher) {
+    use rand::{rngs::SmallRng, Rng, SeedableRng};
+    let mut rng = SmallRng::seed_from_u64(0);
+    let text = (0..10 << 20 >> 3)
+        .flat_map(|_| {
+            let (low, imm) = (rng.gen::<u16>(), rng.gen::<u32>());
+            (u64::from(low) | u64::from(imm) << 32).to_le_bytes()
+        })
+        .collect();
+    bench_dynasm_jit_compile_impl(bencher, text);
+}
+
+/// An unverified SBPFv3 executable of `text`, compiled without no-ops.
+#[cfg(target_arch = "x86_64")]
+fn sbpfv3_executable(text: &[u8]) -> Executable<TestContextObject> {
     let config = Config {
         noop_instruction_rate: 0,
         ..Config::default()
     };
-    let executable = Executable::<TestContextObject>::from_text_bytes(
-        &text,
+    Executable::<TestContextObject>::from_text_bytes(
+        text,
         Arc::new(BuiltinProgram::new_loader(config)),
         SBPFVersion::V3,
         FunctionRegistry::default(),
     )
-    .unwrap();
+    .unwrap()
+}
+
+#[cfg(all(feature = "jit", not(target_os = "windows"), target_arch = "x86_64"))]
+fn bench_jit_compile_impl(bencher: &mut Bencher, text: Vec<u8>) {
+    let executable = sbpfv3_executable(&text);
     bencher.iter(|| executable.jit_compile().unwrap());
     bencher.bytes = executable
         .get_compiled_program()
