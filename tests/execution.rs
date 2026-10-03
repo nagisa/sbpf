@@ -1685,6 +1685,30 @@ fn test_alu64_imm_sign_extension() {
 }
 
 #[test]
+fn test_instruction_meter_checkpoint() {
+    // Without checkpoints, all of the stores would be executed before the meter is checked at the
+    // `exit`.
+    let config = Config {
+        instruction_meter_checkpoint_distance: 1,
+        ..Config::default()
+    };
+    let mut input = [0u8; 4];
+    test_interpreter_and_jit_asm!(
+        "
+        mov64 r0, 0
+        stb [r1+0], 1
+        stb [r1+1], 2
+        stb [r1+2], 3
+        stb [r1+3], 4
+        exit",
+        config,
+        &raw mut input,
+        TestContextObject::new(3),
+        ProgramResult::Err(EbpfError::ExceededMaxInstructions),
+    );
+}
+
+#[test]
 fn test_noop_insertion() {
     let config = Config {
         noop_instruction_rate: 1,
