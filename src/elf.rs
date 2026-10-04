@@ -416,6 +416,27 @@ impl<C: ContextObject> Executable<C> {
         Ok(())
     }
 
+    /// Compile the executable with the dynasm JIT.
+    ///
+    /// The result is stored (and can be retrieved, executed and taken) exactly like the output of
+    /// [`Self::jit_compile`]. SBPF Versions that `codegen` does not support are compiled with
+    /// [`Self::jit_compile`].
+    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(feature = "jit", not(target_os = "windows")))]
+    pub fn dynasm_compile(&self) -> Result<(), crate::error::EbpfError> {
+        if matches!(self.sbpf_version, SBPFVersion::V1 | SBPFVersion::V2) {
+            return self.jit_compile();
+        }
+        let compiled =
+            Arc::new(crate::codegen::x64::jit_templates(self.sbpf_version).compile(self)?);
+        let mut guard = self
+            .compiled_program
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *guard = Some(compiled);
+        Ok(())
+    }
+
     /// Remove the compiled program.
     ///
     /// Note that the results can be unpredictable in presence of concurrent ongoing calls to

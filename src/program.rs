@@ -1,4 +1,6 @@
 //! Common interface for built-in and user supplied programs
+#[cfg(all(feature = "jit", not(target_os = "windows"), target_arch = "x86_64"))]
+use crate::{elf::Executable, vm::EbpfVm};
 use {
     crate::{
         ebpf,
@@ -313,6 +315,7 @@ impl UnsealedJitProgram {
         Ok(JitProgram {
             pc_section: pc_section.protect()?,
             text_section: text_section.protect()?,
+            dynasm: false,
         })
     }
 }
@@ -325,6 +328,9 @@ pub struct JitProgram {
     pc_section: Mapping<Read>,
     /// The executable machine code.
     text_section: Mapping<ReadExecute>,
+    /// Whether the code was produced by `codegen` rather than by the old `jit::JitCompiler`, which
+    /// call it differently.
+    pub(crate) dynasm: bool,
 }
 
 impl JitProgram {
@@ -354,6 +360,17 @@ impl JitProgram {
     /// The total pooled allocation size retained by the compiled program.
     pub fn mem_size(&self) -> usize {
         self.text_section.mapped_len()
+    }
+
+    /// Execute from `vm.registers[11]` with whichever compiler produced this program.
+    #[cfg(all(feature = "jit", not(target_os = "windows"), target_arch = "x86_64"))]
+    pub(crate) fn run<C: ContextObject>(&self, executable: &Executable<C>, vm: &mut EbpfVm<C>) {
+        if self.dynasm {
+            self.dynasm_invoke(executable, vm);
+        } else {
+            let registers = vm.registers;
+            self.invoke(executable.get_config(), vm, registers);
+        }
     }
 }
 
