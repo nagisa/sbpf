@@ -11,6 +11,8 @@ use std::ops::Range;
 use std::ptr::NonNull;
 use std::sync::{Arc, LazyLock, Mutex};
 
+use rand::{thread_rng, Rng};
+
 use crate::error::EbpfError;
 
 #[cfg(not(target_os = "windows"))]
@@ -507,23 +509,90 @@ fn allocate_pages(size_in_bytes: usize) -> Result<*mut u8, EbpfError> {
     }
 }
 
+/// Allocates read-write pages that lie entirely within the first 2 GiB of the address space, so
+/// that code in them can be addressed with sign-extended 32-bit absolute addresses.
+///
+/// The addresses are picked at random, and existing mappings are never replaced.
+pub(crate) unsafe fn allocate_pages_low(size_in_bytes: usize) -> Result<*mut u8, EbpfError> {
+    /// Same as the allocation granularity of Windows.
+    const ALIGNMENT: usize = 64 * 1024;
+    /// Well above the NULL area and where non-PIE executables are loaded.
+    const LOWEST: usize = 256 * 1024 * 1024;
+    const HIGHEST: usize = 2 * 1024 * 1024 * 1024;
+    const ATTEMPTS: usize = 64;
+
+    #[cfg(not(target_os = "windows"))]
+    let errno = libc::ENOMEM;
+    #[cfg(target_os = "windows")]
+    let mut errno = 0;
+    let slots = HIGHEST
+        .saturating_sub(LOWEST)
+        .checked_sub(size_in_bytes)
+        .map(|spare| spare.saturating_div(ALIGNMENT).saturating_add(1));
+    let mut hint = std::ptr::null_mut::<c_void>();
+    if let Some(slots) = slots {
+        for _ in 0..ATTEMPTS {
+            let slot = thread_rng().gen_range(0..slots);
+            hint = LOWEST.saturating_add(slot.saturating_mul(ALIGNMENT)) as *mut c_void;
+            #[cfg(not(target_os = "windows"))]
+            let raw = {
+                let mut raw = hint;
+                // Without `MAP_FIXED` the hint is only honored if the range is free.
+                libc_error_guard!(
+                    mmap,
+                    &mut raw,
+                    size_in_bytes,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
+                    -1,
+                    0,
+                );
+                if raw != hint {
+                    free_pages(raw.cast::<u8>(), size_in_bytes)?;
+                    continue;
+                }
+                raw
+            };
+            #[cfg(target_os = "windows")]
+            let raw = {
+                // Fails if the range is occupied.
+                let raw = VirtualAlloc(hint, size_in_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+                if raw.is_null() {
+                    errno = GetLastError() as i32;
+                    continue;
+                }
+                raw
+            };
+            return Ok(raw.cast::<u8>());
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    let function = "mmap";
+    #[cfg(target_os = "windows")]
+    let function = "VirtualAlloc";
+    Err(EbpfError::LibcInvocationFailed(
+        function,
+        vec![format!("{:?}", hint), format!("{:?}", size_in_bytes)],
+        errno,
+    ))
+}
+
 /// Unmap the pages of an allocation.
 ///
 /// # Safety
 ///
-/// - `raw` and `size_in_bytes` must be a mapping that [`allocate_pages`] created, which is not
-///   freed already.
+/// - `raw` and `size_in_bytes` must be a mapping that [`allocate_pages`] or
+///   [`allocate_pages_low`] created, which is not freed already.
 /// - Nothing may access the allocation afterwards.
-unsafe fn free_pages(raw: *mut u8, size_in_bytes: usize) -> Result<(), EbpfError> {
+pub(crate) unsafe fn free_pages(raw: *mut u8, size_in_bytes: usize) -> Result<(), EbpfError> {
     #[cfg(not(target_os = "windows"))]
     libc_error_guard!(munmap, raw.cast::<c_void>(), size_in_bytes);
     #[cfg(target_os = "windows")]
-    winapi_error_guard!(
-        VirtualFree,
-        raw.cast::<c_void>(),
-        size_in_bytes,
-        MEM_RELEASE,
-    );
+    {
+        // The size must be zero with `MEM_RELEASE`.
+        let _ = size_in_bytes;
+        winapi_error_guard!(VirtualFree, raw.cast::<c_void>(), 0, MEM_RELEASE);
+    }
     Ok(())
 }
 
@@ -542,7 +611,7 @@ pub(crate) enum PagePermissions {
 /// - Specified pages must be in a mapping that the caller owns.
 /// - While `permissions` apply, nothing may access these pages in a way that `permissions` do not
 ///   allow.
-unsafe fn protect_pages(
+pub(crate) unsafe fn protect_pages(
     raw: *mut u8,
     size_in_bytes: usize,
     permissions: PagePermissions,
