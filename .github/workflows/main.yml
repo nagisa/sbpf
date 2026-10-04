@@ -44,6 +44,7 @@ jobs:
         cargo test --verbose
         cargo test --test exercise_instructions --verbose
         cargo test --features="tracer,debugger" --verbose
+        cargo test --features="codegen_debug" --verbose
       shell: bash
     - name: CLI - Lint
       run: |

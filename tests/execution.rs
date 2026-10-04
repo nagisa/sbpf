@@ -1194,14 +1194,10 @@ fn test_err_ldxdw_nomem() {
             "unallocated"
         )),
     );
-}
-
-#[test]
-fn test_err_ldxdw_nomem_capped() {
     // The access violation would only be detected after running out of budget.
     test_interpreter_and_jit_asm!(
         "
-        mov64 r0, 0x0
+        add64 r10, 0
         ldxdw r0, [r1+6]
         exit",
         NO_INPUT,
@@ -1241,22 +1237,6 @@ fn test_memory_access_preserves_registers() {
         NO_INPUT,
         TestContextObject::new(24),
         ProgramResult::Ok(0x5ff),
-    );
-}
-
-#[test]
-fn test_store_imm_truncation() {
-    test_interpreter_and_jit_asm!(
-        "
-        stdw [r10-8], -1
-        stw [r10-8], 0x12345678
-        sth [r10-8], -2
-        stb [r10-8], 0x7f
-        ldxdw r0, [r10-8]
-        exit",
-        NO_INPUT,
-        TestContextObject::new(6),
-        ProgramResult::Ok(0xffffffff1234ff7f),
     );
 }
 
@@ -1771,9 +1751,6 @@ fn test_conditional_jumps() {
         (ebpf::BPF_JLE, 7, 3, ELSE),
         (ebpf::BPF_JSET, 3, 7, THEN),
         (ebpf::BPF_JSET, 2, 4, ELSE),
-        (ebpf::BPF_JSET, 3, 3, THEN),
-        (ebpf::BPF_JSET, 4, 3, ELSE),
-        (ebpf::BPF_JSET, 6, 4, THEN),
         (ebpf::BPF_JSET, -8, 7, ELSE),
         (ebpf::BPF_JNE, 3, 7, THEN),
         (ebpf::BPF_JNE, 3, 3, ELSE),
@@ -1816,6 +1793,34 @@ fn test_conditional_jumps() {
             );
         }
     }
+}
+
+#[test]
+fn test_jset_upper_half() {
+    // The only bit in common is in the upper half.
+    test_interpreter_and_jit_asm!(
+        "
+        lddw r1, 0x100000000
+        mov64 r0, 0
+        jset r1, -1, +1
+        mov64 r0, 1
+        exit",
+        NO_INPUT,
+        TestContextObject::new(4),
+        ProgramResult::Ok(0),
+    );
+    test_interpreter_and_jit_asm!(
+        "
+        lddw r1, 0x100000000
+        mov64 r2, -1
+        mov64 r0, 0
+        jset r1, r2, +1
+        mov64 r0, 1
+        exit",
+        NO_INPUT,
+        TestContextObject::new(5),
+        ProgramResult::Ok(0),
+    );
 }
 
 // Call Stack
@@ -2348,26 +2353,6 @@ fn test_err_callx_oob_computed() {
 }
 
 #[test]
-fn test_err_callx_depth_exceeded() {
-    let max_call_depth = Config::default().max_call_depth as u64;
-    for (budget, expected) in [
-        (3 * max_call_depth - 1, EbpfError::ExceededMaxInstructions),
-        (3 * max_call_depth, EbpfError::CallDepthExceeded),
-    ] {
-        test_interpreter_and_jit_asm!(
-            "
-            mov64 r8, 0x1
-            lsh64 r8, 0x20
-            callx r8
-            exit",
-            NO_INPUT,
-            TestContextObject::new(budget),
-            ProgramResult::Err(expected),
-        );
-    }
-}
-
-#[test]
 fn test_err_callx_oob_low() {
     let config = Config {
         enabled_sbpf_versions: SBPFVersion::V0..=SBPFVersion::V0,
@@ -2488,10 +2473,23 @@ fn test_err_reg_stack_depth() {
             lsh64 r0, 0x20
             callx r0
             exit",
-            config,
+            config.clone(),
             NO_INPUT,
             TestContextObject::new(4 * max_call_depth as u64),
             ProgramResult::Err(EbpfError::CallDepthExceeded),
+        );
+        // One instruction short of detecting the depth being exceeded.
+        test_interpreter_and_jit_asm!(
+            "
+            add64 r10, 0
+            mov64 r0, 0x1
+            lsh64 r0, 0x20
+            callx r0
+            exit",
+            config,
+            NO_INPUT,
+            TestContextObject::new(4 * max_call_depth as u64 - 1),
+            ProgramResult::Err(EbpfError::ExceededMaxInstructions),
         );
     }
 }
@@ -2891,17 +2889,24 @@ fn test_tight_infinite_loop_unconditional() {
 
 #[test]
 fn test_tight_infinite_recursion() {
-    test_interpreter_and_jit_asm!(
-        "
-        entrypoint:
-        add64 r10, 0
-        mov64 r3, 0x41414141
-        call entrypoint
-        exit",
-        NO_INPUT,
-        TestContextObject::new(6),
-        ProgramResult::Err(EbpfError::ExceededMaxInstructions),
-    );
+    let max_call_depth = Config::default().max_call_depth as u64;
+    for (budget, expected) in [
+        (6, EbpfError::ExceededMaxInstructions),
+        (3 * max_call_depth - 1, EbpfError::ExceededMaxInstructions),
+        (3 * max_call_depth, EbpfError::CallDepthExceeded),
+    ] {
+        test_interpreter_and_jit_asm!(
+            "
+            entrypoint:
+            add64 r10, 0
+            mov64 r3, 0x41414141
+            call entrypoint
+            exit",
+            NO_INPUT,
+            TestContextObject::new(budget),
+            ProgramResult::Err(expected),
+        );
+    }
 }
 
 #[test]
@@ -2923,10 +2928,11 @@ fn test_entrypoint_not_first() {
 
 #[test]
 fn test_nested_calls_return() {
-    // Calls return to the right place and leave the meter and the call depth as they were.
+    // Calls return to the right place and leave the meter and the call depth as they were. There
+    // are more nested calls than the depth allows, were it not for the returns.
     test_interpreter_and_jit_asm!(
         "
-        mov64 r6, 30
+        mov64 r6, 40
         loop:
         call function_foo
         sub64 r6, 1
@@ -2939,30 +2945,9 @@ fn test_nested_calls_return() {
         function_bar:
         exit",
         NO_INPUT,
-        TestContextObject::new(183),
+        TestContextObject::new(243),
         ProgramResult::Ok(7),
     );
-}
-
-#[test]
-fn test_err_call_depth_exceeded() {
-    let max_call_depth = Config::default().max_call_depth as u64;
-    for (budget, expected) in [
-        (3 * max_call_depth - 1, EbpfError::ExceededMaxInstructions),
-        (3 * max_call_depth, EbpfError::CallDepthExceeded),
-    ] {
-        test_interpreter_and_jit_asm!(
-            "
-            entrypoint:
-            add64 r10, 0
-            mov64 r3, 0x41414141
-            call entrypoint
-            exit",
-            NO_INPUT,
-            TestContextObject::new(budget),
-            ProgramResult::Err(expected),
-        );
-    }
 }
 
 #[test]
@@ -3882,6 +3867,42 @@ fn test_mov32_reg_truncating() {
 }
 
 #[test]
+fn test_err_call_imm_unknown_src() {
+    // The verifier accepts any source register up to 10. The meter is checked before the error.
+    let mut prog = [0; 32];
+    prog[0] = ebpf::MOV64_IMM;
+    prog[8] = ebpf::MOV64_IMM;
+    prog[16] = ebpf::CALL_IMM;
+    prog[17] = 5 << 4;
+    LittleEndian::write_u32(&mut prog[20..], 100);
+    prog[24] = ebpf::EXIT;
+    let config = Config {
+        enabled_sbpf_versions: SBPFVersion::V3..=SBPFVersion::V3,
+        ..Config::default()
+    };
+    let loader = Arc::new(BuiltinProgram::new_loader(config));
+    for (budget, expected) in [
+        (2, EbpfError::ExceededMaxInstructions),
+        (3, EbpfError::UnsupportedInstruction),
+    ] {
+        #[allow(unused_mut)]
+        let mut executable = Executable::<TestContextObject>::from_text_bytes(
+            &prog,
+            loader.clone(),
+            SBPFVersion::V3,
+            FunctionRegistry::default(),
+        )
+        .unwrap();
+        test_interpreter_and_jit!(
+            executable,
+            NO_INPUT,
+            TestContextObject::new(budget),
+            ProgramResult::Err(expected),
+        );
+    }
+}
+
+#[test]
 fn test_lddw() {
     let config = Config {
         enabled_sbpf_versions: SBPFVersion::V0..=SBPFVersion::V0,
@@ -3915,6 +3936,17 @@ fn test_lddw() {
         NO_INPUT,
         TestContextObject::new(3),
         ProgramResult::Ok(0x80000000),
+    );
+    // Neither half is sign extended.
+    test_interpreter_and_jit_asm!(
+        "
+        add64 r10, 0
+        lddw r0, 0x80000000ffffffff
+        exit",
+        config.clone(),
+        NO_INPUT,
+        TestContextObject::new(3),
+        ProgramResult::Ok(0x80000000ffffffff),
     );
     test_interpreter_and_jit_asm!(
         "
@@ -4012,62 +4044,6 @@ fn test_lddw() {
 }
 
 #[test]
-fn test_lddw_value() {
-    for (value, expected) in [
-        ("0x1122334455667788", 0x1122334455667788u64),
-        // Neither half is sign extended.
-        ("0x80000000ffffffff", 0x80000000ffffffff),
-        ("0xffffffff", 0xffffffff),
-    ] {
-        test_interpreter_and_jit_asm!(
-            &format!(
-                "
-                lddw r0, {}
-                exit",
-                value
-            ),
-            NO_INPUT,
-            TestContextObject::new(2),
-            ProgramResult::Ok(expected),
-        );
-    }
-}
-
-#[test]
-fn test_lddw_meter() {
-    // Each `lddw` counts as a single instruction.
-    for (budget, expected) in [
-        (4, ProgramResult::Ok(3)),
-        (3, ProgramResult::Err(EbpfError::ExceededMaxInstructions)),
-    ] {
-        test_interpreter_and_jit_asm!(
-            "
-            lddw r1, 0x1
-            lddw r0, 0x2
-            add64 r0, r1
-            exit",
-            NO_INPUT,
-            TestContextObject::new(budget),
-            expected,
-        );
-    }
-}
-
-#[test]
-fn test_lddw_jump_over() {
-    test_interpreter_and_jit_asm!(
-        "
-        mov64 r0, 0x1
-        ja +2
-        lddw r0, 0x2
-        exit",
-        NO_INPUT,
-        TestContextObject::new(3),
-        ProgramResult::Ok(1),
-    );
-}
-
-#[test]
 fn test_lddw_call_target() {
     test_interpreter_and_jit_asm!(
         "
@@ -4096,74 +4072,6 @@ fn test_err_callx_into_lddw() {
         NO_INPUT,
         TestContextObject::new(5),
         ProgramResult::Err(EbpfError::UnsupportedInstruction),
-    );
-}
-
-#[test]
-fn test_le() {
-    let config = Config {
-        enabled_sbpf_versions: SBPFVersion::V0..=SBPFVersion::V0,
-        ..Config::default()
-    };
-    let input = [0x22, 0x11];
-    test_interpreter_and_jit_asm!(
-        "
-        add64 r10, 0
-        ldxh r0, [r1]
-        le16 r0
-        exit",
-        config.clone(),
-        &raw const input,
-        TestContextObject::new(4),
-        ProgramResult::Ok(0x1122),
-    );
-    let input = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
-    test_interpreter_and_jit_asm!(
-        "
-        add64 r10, 0
-        ldxdw r0, [r1]
-        le16 r0
-        exit",
-        config.clone(),
-        &raw const input,
-        TestContextObject::new(4),
-        ProgramResult::Ok(0x2211),
-    );
-    let input = [0x44, 0x33, 0x22, 0x11];
-    test_interpreter_and_jit_asm!(
-        "
-        add64 r10, 0
-        ldxw r0, [r1]
-        le32 r0
-        exit",
-        config.clone(),
-        &raw const input,
-        TestContextObject::new(4),
-        ProgramResult::Ok(0x11223344),
-    );
-    let input = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
-    test_interpreter_and_jit_asm!(
-        "
-        add64 r10, 0
-        ldxdw r0, [r1]
-        le32 r0
-        exit",
-        config.clone(),
-        &raw const input,
-        TestContextObject::new(4),
-        ProgramResult::Ok(0x44332211),
-    );
-    let input = [0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11];
-    test_interpreter_and_jit_asm!(
-        "
-        add64 r10, 0
-        ldxdw r0, [r1]
-        le64 r0
-        exit",
-        config,
-        &raw const input,
-        TestContextObject::new(4),
-        ProgramResult::Ok(0x1122334455667788),
     );
 }
 
@@ -4531,25 +4439,26 @@ fn test_div_imm_extension() {
         TestContextObject::new(6),
         ProgramResult::Ok(2),
     );
+    // Remainders, and a destination other than the registers `div` uses.
+    test_interpreter_and_jit_asm!(
+        "
+        mov64 r0, -1
+        mod64 r0, -2
+        mov64 r1, -1
+        mod32 r1, -2
+        mov64 r2, 7
+        div64 r2, 2
+        add64 r0, r1
+        add64 r0, r2
+        exit",
+        NO_INPUT,
+        TestContextObject::new(9),
+        ProgramResult::Ok(5),
+    );
 }
 
 #[test]
 fn test_err_div_mod_by_zero_reg() {
-    for op in ["div64", "mod64", "div32", "mod32"] {
-        test_interpreter_and_jit_asm!(
-            &format!(
-                "
-                mov64 r0, 5
-                mov64 r1, 0
-                {} r0, r1
-                exit",
-                op
-            ),
-            NO_INPUT,
-            TestContextObject::new(3),
-            ProgramResult::Err(EbpfError::DivideByZero),
-        );
-    }
     // Only the low 32 bits of the divisor are zero.
     for op in ["div32", "mod32"] {
         test_interpreter_and_jit_asm!(
@@ -4616,6 +4525,41 @@ fn test_stack_gaps() {
             1
         )),
     );
+
+    // The frame of the callee is a frame and a gap past the frame of the caller, so the stack of
+    // the caller is not where it would be without the gaps.
+    for (enable_stack_frame_gaps, budget, expected) in [
+        (
+            true,
+            3,
+            ProgramResult::Err(EbpfError::StackAccessViolation(
+                AccessType::Load,
+                0x200001ff8,
+                8,
+                1,
+            )),
+        ),
+        (false, 5, ProgramResult::Ok(77)),
+    ] {
+        let config = Config {
+            enabled_sbpf_versions: SBPFVersion::V0..=SBPFVersion::V0,
+            enable_stack_frame_gaps,
+            ..Config::default()
+        };
+        test_interpreter_and_jit_asm!(
+            "
+            stw [r10 - 8], 77
+            call function_foo
+            exit
+            function_foo:
+            ldxdw r0, [r10 - 4104]
+            exit",
+            config,
+            NO_INPUT,
+            TestContextObject::new(budget),
+            expected,
+        );
+    }
 
     // V3 and V4 do not have stack gaps, so we should see 77 as the return.
     let config = Config {
