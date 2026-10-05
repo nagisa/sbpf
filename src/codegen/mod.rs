@@ -110,13 +110,6 @@ impl JitProgram {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum MemoryAccessKind {
-    Load,
-    StoreImm,
-    StoreReg,
-}
-
 /// A BPF register.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Reg(u8);
