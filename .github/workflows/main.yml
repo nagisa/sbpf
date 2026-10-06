@@ -18,15 +18,22 @@ jobs:
       matrix:
         os: [macos-latest, ubuntu-latest, windows-latest]
         rust: [stable, beta, nightly]
+    env:
+      LLVM_PROFILE_FILE: ${{ github.workspace }}/target/profraw/%p-%m.profraw
     steps:
-    - uses: actions/checkout@v1
+    - uses: actions/checkout@v4
     - name: Setup Rust (rustup)
       run: |
         rustup update ${{ matrix.rust }} --no-self-update
         rustup default ${{ matrix.rust }}
         rustup component add clippy
         rustup component add rustfmt
+        rustup component add llvm-tools
       shell: bash
+    - name: Install grcov
+      uses: taiki-e/install-action@v2
+      with:
+        tool: grcov
     - name: Lint
       run: |
         cargo fmt --all -- --check
@@ -35,12 +42,30 @@ jobs:
       shell: bash
     - name: Build and test
       run: |
-        export RUSTFLAGS="-D warnings"
+        export RUSTFLAGS="-D warnings -Cinstrument-coverage"
         cargo build --verbose
         cargo build --features="shuttle-test"
         cargo test --verbose
         cargo test --test exercise_instructions --verbose
       shell: bash
+    - name: Collect test coverage
+      run: |
+        grcov target/profraw \
+          --source-dir . \
+          --binary-path target/debug \
+          --output-types lcov \
+          --output-path lcov.info \
+          --branch \
+          --ignore-not-existing \
+          --keep-only 'src/*'
+        test -s lcov.info
+      shell: bash
+    - name: Upload test coverage
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-${{ matrix.os }}-${{ matrix.rust }}
+        path: lcov.info
+        if-no-files-found: error
     - name: CLI - Lint
       run: |
         cargo fmt --all --manifest-path cli/Cargo.toml -- --check
@@ -67,46 +92,32 @@ jobs:
 
   coverage:
     name: Coverage
+    needs: test
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
-    - name: Setup Rust (rustup)
-      run: |
-        rustup update nightly --no-self-update
-        rustup default nightly
-        rustup component add llvm-tools
-      shell: bash
     - name: Install grcov
       uses: taiki-e/install-action@v2
       with:
         tool: grcov
-    - name: Run instrumented tests
-      env:
-        CARGO_INCREMENTAL: 0
-        RUSTFLAGS: -Cinstrument-coverage
-        RUSTDOCFLAGS: -Cinstrument-coverage
-        LLVM_PROFILE_FILE: ${{ github.workspace }}/target/coverage/profraw/%p-%m.profraw
-        CARGO_TARGET_DIR: ${{ github.workspace }}/target/coverage
-      run: cargo test --verbose
-      shell: bash
-    - name: Generate test coverage
+    - name: Download test coverage
+      uses: actions/download-artifact@v4
+      with:
+        pattern: coverage-*
+        path: coverage
+    - name: Merge test coverage
       run: |
-        grcov target/coverage/profraw \
+        grcov coverage \
           --source-dir . \
-          --binary-path target/coverage/debug \
           --output-types lcov \
-          --output-path coverage.info \
-          --branch \
-          --ignore-not-existing \
-          --ignore '/*' \
-          --ignore 'target/*' \
-          --keep-only 'src/*'
+          --output-path coverage.info
         test -s coverage.info
       shell: bash
     - name: Upload test coverage
       uses: codecov/codecov-action@v5
       with:
         files: coverage.info
+        disable_search: true
         token: ${{ secrets.CODECOV_TOKEN }}
         fail_ci_if_error: true
 
