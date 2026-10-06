@@ -234,9 +234,9 @@ pub struct UnsealedJitProgram {
     pc_section: Mapping,
     /// The machine code.
     text_section: Mapping,
-    /// The file the text pages are mapped from, see `codegen::debug`.
-    #[cfg(all(feature = "codegen_debug", target_arch = "x86_64", target_os = "linux"))]
-    pub(crate) code_file: Option<crate::codegen::debug::CodeFile>,
+    /// What the debugging aids keep of the code, see `codegen::debug`.
+    #[cfg(all(feature = "codegen-debug", target_arch = "x86_64", target_os = "linux"))]
+    pub(crate) code_record: Option<crate::codegen::debug::CodeRecord>,
 }
 
 impl UnsealedJitProgram {
@@ -256,8 +256,8 @@ impl UnsealedJitProgram {
         let mut program = Self {
             pc_section,
             text_section,
-            #[cfg(all(feature = "codegen_debug", target_arch = "x86_64", target_os = "linux"))]
-            code_file: None,
+            #[cfg(all(feature = "codegen-debug", target_arch = "x86_64", target_os = "linux"))]
+            code_record: None,
         };
         // The pc section relies on zero-initialization to distinguish unfilled forward-jump
         // targets from filled backward-jump targets in the old JIT. The pool may hand back
@@ -309,8 +309,8 @@ impl UnsealedJitProgram {
         let Self {
             pc_section,
             mut text_section,
-            #[cfg(all(feature = "codegen_debug", target_arch = "x86_64", target_os = "linux"))]
-            code_file,
+            #[cfg(all(feature = "codegen-debug", target_arch = "x86_64", target_os = "linux"))]
+            code_record,
         } = self;
         if used > text_section.len() {
             return Err(EbpfError::ExhaustedTextSegment(used));
@@ -323,8 +323,8 @@ impl UnsealedJitProgram {
             pc_section: pc_section.protect()?,
             text_section: text_section.protect()?,
             dynasm: false,
-            #[cfg(all(feature = "codegen_debug", target_arch = "x86_64", target_os = "linux"))]
-            code_file,
+            #[cfg(all(feature = "codegen-debug", target_arch = "x86_64", target_os = "linux"))]
+            code_record,
         })
     }
 }
@@ -340,9 +340,9 @@ pub struct JitProgram {
     /// Whether the code was produced by `codegen` rather than by the old `jit::JitCompiler`, which
     /// call it differently.
     pub(crate) dynasm: bool,
-    /// The file the text pages are mapped from, see `codegen::debug`.
-    #[cfg(all(feature = "codegen_debug", target_arch = "x86_64", target_os = "linux"))]
-    pub(crate) code_file: Option<crate::codegen::debug::CodeFile>,
+    /// What the debugging aids keep of the code, see `codegen::debug`.
+    #[cfg(all(feature = "codegen-debug", target_arch = "x86_64", target_os = "linux"))]
+    pub(crate) code_record: Option<crate::codegen::debug::CodeRecord>,
 }
 
 impl JitProgram {
@@ -388,16 +388,16 @@ impl JitProgram {
 
 impl Drop for JitProgram {
     fn drop(&mut self) {
-        #[cfg(all(feature = "codegen_debug", target_arch = "x86_64", target_os = "linux"))]
-        if let Some(code_file) = self.code_file.take() {
+        #[cfg(all(feature = "codegen-debug", target_arch = "x86_64", target_os = "linux"))]
+        if let Some(code_record) = self.code_record.take() {
             // SAFETY:
             //
-            // Contract from `CodeFile::release`: the mapped range must still be owned by the
-            // caller, and not accessed while this runs or relied on afterwards.
-            // Evidence: the file was mapped over `text_section`, which is only returned to the
-            // pool after this, when the sections are dropped. Dropping `self` means that nothing
+            // Contract from `CodeRecord::release`: the range must still be owned by the caller,
+            // and not accessed while this runs or relied on afterwards.
+            // Evidence: the record is of `text_section`, which is only returned to the pool after
+            // this, when the sections are dropped. Dropping `self` means that nothing
             // executes or reads the code, and the pool treats the memory as arbitrary bytes.
-            unsafe { code_file.release() };
+            unsafe { code_record.release() };
         }
     }
 }
