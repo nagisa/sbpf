@@ -69,23 +69,46 @@ jobs:
     name: Coverage
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v1
+    - uses: actions/checkout@v4
     - name: Setup Rust (rustup)
       run: |
         rustup update nightly --no-self-update
         rustup default nightly
-        rustup component add llvm-tools-preview
+        rustup component add llvm-tools
       shell: bash
-    - name: Install cargo-llvm-cov
-      run: cargo install cargo-llvm-cov
+    - name: Install grcov
+      uses: taiki-e/install-action@v2
+      with:
+        tool: grcov
+    - name: Run instrumented tests
+      env:
+        CARGO_INCREMENTAL: 0
+        RUSTFLAGS: -Cinstrument-coverage
+        RUSTDOCFLAGS: -Cinstrument-coverage
+        LLVM_PROFILE_FILE: ${{ github.workspace }}/target/coverage/profraw/%p-%m.profraw
+        CARGO_TARGET_DIR: ${{ github.workspace }}/target/coverage
+      run: cargo test --verbose
       shell: bash
     - name: Generate test coverage
       run: |
-        cargo llvm-cov --lcov --output-path coverage.info
+        grcov target/coverage/profraw \
+          --source-dir . \
+          --binary-path target/coverage/debug \
+          --output-types lcov \
+          --output-path coverage.info \
+          --branch \
+          --ignore-not-existing \
+          --ignore '/*' \
+          --ignore 'target/*' \
+          --keep-only 'src/*'
+        test -s coverage.info
       shell: bash
     - name: Upload test coverage
-      run: bash <(curl -s https://codecov.io/bash) -f coverage.info || echo "Codecov did not collect coverage reports"
-      shell: bash
+      uses: codecov/codecov-action@v5
+      with:
+        files: coverage.info
+        token: ${{ secrets.CODECOV_TOKEN }}
+        fail_ci_if_error: true
 
   release:
     name: Release
