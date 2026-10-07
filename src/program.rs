@@ -321,6 +321,7 @@ impl UnsealedJitProgram {
             pc_section: pc_section.protect()?,
             text_section: text_section.protect()?,
             dynasm: false,
+            random_key: 0,
             #[cfg(all(feature = "codegen-debug", target_arch = "x86_64", target_os = "linux"))]
             code_record,
         })
@@ -339,6 +340,11 @@ pub struct JitProgram {
     /// call it differently.
     #[cfg_attr(not(target_arch = "x86_64"), expect(dead_code))]
     pub(crate) dynasm: bool,
+    /// For the code produced by jit this is a random value by which some randomzation can be
+    /// applied to user data to prevent e.g. JIT spraying.
+    // FIXME: could be shared with old jit for its own encryption key thing.
+    #[cfg_attr(not(target_arch = "x86_64"), expect(dead_code))]
+    pub(crate) random_key: u32,
     /// What the debugging aids keep of the code, see `codegen::debug`.
     #[cfg(all(feature = "codegen-debug", target_arch = "x86_64", target_os = "linux"))]
     pub(crate) code_record: Option<crate::codegen::debug::CodeRecord>,
