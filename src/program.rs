@@ -5,8 +5,7 @@ use {
         elf::ElfError,
         error::EbpfError,
         memory_management::{
-            allocate_pages_pooled, free_pages_pooled, get_system_page_size, protect_pages,
-            round_to_page_size, PagePermissions,
+            get_system_page_size, protect_pages, round_to_page_size, PagePermissions, PooledPages,
         },
         vm::{Config, ContextObject, EncryptedHostAddressToEbpfVm},
     },
@@ -232,8 +231,8 @@ impl<T: Copy + PartialEq> FunctionRegistry<T> {
 
 /// The JIT output for a program, in a single pooled allocation.
 pub struct JitProgram {
-    /// Size of the pooled allocation.
-    allocation_size: usize,
+    /// The pooled allocation that `pc_section` and `text_section` point into.
+    pages: PooledPages,
     /// Offset to each BPF instruction's machine code within `text_section`.
     pc_section: NonNull<[u32]>,
     /// The executable machine code.
@@ -252,8 +251,8 @@ impl JitProgram {
         let page_size = get_system_page_size();
         let pc_size = round_to_page_size(pc.saturating_mul(std::mem::size_of::<u32>()), page_size);
         let text_capacity = round_to_page_size(code_capacity, page_size);
-        let (raw, allocation_size) = allocate_pages_pooled(pc_size.saturating_add(text_capacity));
-        let raw = NonNull::new(raw).expect("the pooled allocation is never null");
+        let pages = PooledPages::new(pc_size.saturating_add(text_capacity));
+        let raw = pages.as_ptr();
         let text = unsafe { raw.add(pc_size) };
         let pc_section = NonNull::slice_from_raw_parts(raw.cast::<u32>(), pc);
         // The pc section relies on zero-initialization to distinguish unfilled forward-jump
@@ -261,7 +260,7 @@ impl JitProgram {
         // recycled memory. Zero just the pc section here.
         unsafe { std::ptr::write_bytes(pc_section.cast::<u32>().as_ptr(), 0, pc) };
         Self {
-            allocation_size,
+            pages,
             pc_section,
             text_section: NonNull::slice_from_raw_parts(text, text_capacity),
             sealed: false,
@@ -334,15 +333,16 @@ impl JitProgram {
 
     /// The total pooled allocation size retained by the compiled program.
     pub fn mem_size(&self) -> usize {
-        self.allocation_size
+        self.pages.len()
     }
-}
 
-impl Drop for JitProgram {
-    fn drop(&mut self) {
-        unsafe {
-            free_pages_pooled(self.pc_section.as_ptr().cast::<u8>(), self.allocation_size);
-        }
+    /// Whether the machine code is still mapped in this process.
+    ///
+    /// This is `false` in a `fork`ed child for programs compiled before the `fork`: their memory
+    /// is not inherited by the child. Such a program must not be executed or inspected, only
+    /// dropped (or forgotten).
+    pub fn is_valid(&self) -> bool {
+        self.pages.is_valid()
     }
 }
 

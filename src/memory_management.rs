@@ -6,7 +6,12 @@
 
 #![cfg_attr(target_os = "windows", allow(dead_code))]
 
-use std::sync::{LazyLock, Mutex};
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::{
+    ptr::NonNull,
+    sync::{LazyLock, Mutex},
+};
 
 use crate::error::EbpfError;
 
@@ -30,10 +35,121 @@ use {
     },
 };
 
+/// Detects `fork` by way of a `MADV_WIPEONFORK` page, and counts forks as a *generation*.
+///
+/// Pool memory is `MAP_SHARED` (so that `mprotect` can be cheap) and `MADV_DONTFORK`, which means
+/// that after a `fork` the child has a hole where every mapping used to be. Anything the child
+/// inherited that points into such a hole is dangling, and worse, the kernel is free to place a
+/// new unrelated mapping into the hole. Each mapping is therefore stamped with the generation it
+/// was created in, and mappings of an older generation are never touched again: not read, not
+/// `mprotect`ed, not `munmap`ed and not handed out of the pool.
+///
+/// The kernel zeroes a `MADV_WIPEONFORK` page in the child, so noticing a fork costs a single
+/// load in the common case and no syscalls or locks.
+#[cfg(target_os = "linux")]
+struct ForkTracker {
+    /// Lives in a `MADV_WIPEONFORK` page; the page is never unmapped.
+    state: &'static AtomicU32,
+    /// The current generation. Starts at 1 and is bumped exactly once per observed fork.
+    generation: AtomicU64,
+}
+
+#[cfg(target_os = "linux")]
+impl ForkTracker {
+    /// The page was wiped by a fork (or never initialized).
+    const WIPED: u32 = 0;
+    /// A thread is bumping the generation.
+    const REFRESHING: u32 = 1;
+    /// The generation is current.
+    const CLEAN: u32 = 2;
+
+    /// Returns `None` when the kernel does not support `MADV_WIPEONFORK` (Linux < 4.14).
+    fn new() -> Option<Self> {
+        unsafe {
+            let len = get_system_page_size();
+            let page = libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
+                -1,
+                0,
+            );
+            if page == libc::MAP_FAILED {
+                return None;
+            }
+            // Only private anonymous mappings may be wiped on fork, hence this is not part of
+            // the (shared) pool memory.
+            if libc::madvise(page, len, libc::MADV_WIPEONFORK) != 0 {
+                libc::munmap(page, len);
+                return None;
+            }
+            let state = &*page.cast::<AtomicU32>();
+            state.store(Self::CLEAN, Ordering::Release);
+            Some(Self {
+                state,
+                generation: AtomicU64::new(1),
+            })
+        }
+    }
+
+    /// The current generation, noticing any fork that happened since the last call.
+    #[inline]
+    fn generation(&self) -> u64 {
+        if self.state.load(Ordering::Acquire) != Self::CLEAN {
+            self.refresh();
+        }
+        self.generation.load(Ordering::Acquire)
+    }
+
+    #[cold]
+    fn refresh(&self) {
+        loop {
+            match self.state.compare_exchange(
+                Self::WIPED,
+                Self::REFRESHING,
+                Ordering::Acquire,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    // The bump must be visible before `CLEAN` is, so that no thread observes
+                    // `CLEAN` and goes on to use the previous generation.
+                    self.generation.fetch_add(1, Ordering::Relaxed);
+                    self.state.store(Self::CLEAN, Ordering::Release);
+                    return;
+                }
+                Err(Self::CLEAN) => return,
+                // Another thread is bumping the generation, which only takes an instant.
+                Err(_) => std::hint::spin_loop(),
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+static FORK_TRACKER: LazyLock<Option<ForkTracker>> = LazyLock::new(ForkTracker::new);
+
+/// Identifies which address space (as in: before or after which `fork`) a mapping belongs to.
+///
+/// Always `0` on targets that cannot track forks. Those targets use `MAP_PRIVATE` mappings,
+/// which are already fork-safe.
+#[inline]
+fn current_generation() -> u64 {
+    cfg_select! {
+        target_os = "linux" => {
+            match &*FORK_TRACKER {
+                Some(tracker) => tracker.generation(),
+                None => 0,
+            }
+        }
+        _ => 0
+    }
+}
+
 /// A free list for managing memory allocations of a fixed size.
 struct FreeList {
-    /// Pool of free blocks awaiting reuse.
-    mem: Mutex<Vec<*mut u8>>,
+    /// Pool of free blocks awaiting reuse, each with the generation it was allocated in.
+    mem: Mutex<Vec<(*mut u8, u64)>>,
     /// The size of each memory block.
     size: usize,
 }
@@ -59,18 +175,33 @@ impl FreeList {
     ///
     /// If a free block is available, it is reused; otherwise, a new block is allocated.
     ///
-    /// Returns a pointer to the allocated memory and the size of the allocation.
+    /// Returns a pointer to the allocated memory, the size of the allocation and the generation
+    /// the allocation belongs to.
     /// Returned memory has read-write permissions and may contain arbitrary
     /// bytes left over from a previous owner; the caller should not assume
     /// any particular contents.
-    fn alloc(&self) -> (*mut u8, usize) {
-        let ptr = { self.mem.lock().unwrap_or_else(|e| e.into_inner()).pop() };
+    fn alloc(&self) -> (*mut u8, usize, u64) {
+        // Notice a fork before looking at the pool.
+        let generation = current_generation();
+        let ptr = {
+            let mut mem = self.mem.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                match mem.pop() {
+                    Some((ptr, g)) if g == generation => break Some(ptr),
+                    // The block predates a fork and is not mapped in this process anymore. Forget
+                    // it: the address may have been reused by something else, so it must not be
+                    // unmapped either.
+                    Some(_) => continue,
+                    None => break None,
+                }
+            }
+        };
         let ptr = match ptr {
             Some(ptr) => ptr,
             None => unsafe { allocate_pages(self.size) }.expect("allocation failed"),
         };
 
-        (ptr, self.size)
+        (ptr, self.size, generation)
     }
 
     /// Free the given allocation, returning it to the pool.
@@ -80,10 +211,11 @@ impl FreeList {
     /// - `ptr` must have been returned by [`FreeList::alloc`] on this same
     ///   instance and not already returned to the pool.
     /// - `size` must equal the size configured at construction.
+    /// - `generation` must be the one `alloc` returned alongside `ptr`.
     /// - The caller must not retain any reference into the block after calling
     ///   `free`; subsequent `alloc` calls may hand the same memory to another
     ///   owner.
-    unsafe fn free(&self, ptr: *mut u8, size: usize) {
+    unsafe fn free(&self, ptr: *mut u8, size: usize, generation: u64) {
         /// The threshold for discarding physical backing from returned memory.
         ///
         /// Allocations at or above 128 MiB are uncommon, so drop their
@@ -92,6 +224,12 @@ impl FreeList {
 
         if size != self.size {
             panic!("free size mismatch: expected {}, got {}", self.size, size);
+        }
+
+        // The block was allocated before a fork. It is not mapped in this process anymore (or,
+        // worse, something unrelated is mapped there), so there is nothing to give back.
+        if generation != current_generation() {
+            return;
         }
 
         unsafe { protect_pages(ptr, self.size, PagePermissions::ReadWrite) }
@@ -103,17 +241,22 @@ impl FreeList {
             }
         }
 
-        self.mem.lock().unwrap_or_else(|e| e.into_inner()).push(ptr);
+        self.mem
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((ptr, generation));
     }
 }
 
 impl Drop for FreeList {
     fn drop(&mut self) {
-        for ptr in self
+        let generation = current_generation();
+        for (ptr, _) in self
             .mem
             .get_mut()
             .unwrap_or_else(|e| e.into_inner())
             .drain(..)
+            .filter(|&(_, g)| g == generation)
         {
             if let Err(e) = unsafe { free_pages(ptr, self.size) } {
                 log::error!("FreeList: unable to free {e}");
@@ -173,9 +316,9 @@ impl BucketedFreeList {
         bucket_bits as usize - const { BUCKET_MIN.trailing_zeros() as usize }
     }
 
-    /// Allocate memory of at least the given size, returning a pointer to the allocation
-    /// and the actual size allocated.
-    fn alloc(&self, size: usize) -> (*mut u8, usize) {
+    /// Allocate memory of at least the given size, returning a pointer to the allocation,
+    /// the actual size allocated and the generation it belongs to.
+    fn alloc(&self, size: usize) -> (*mut u8, usize, u64) {
         self.buckets[Self::bucket_idx(size)].alloc()
     }
 
@@ -185,33 +328,74 @@ impl BucketedFreeList {
     ///
     /// - `ptr` must have been returned by [`BucketedFreeList::alloc`] on this same
     ///   instance and not already returned to the pool.
+    /// - `generation` must be the one `alloc` returned alongside `ptr`.
     /// - The caller must not retain any reference into the block after calling
     ///   `free`; subsequent `alloc` calls may hand the same memory to another
     ///   owner.
-    unsafe fn free(&self, ptr: *mut u8, size: usize) {
-        unsafe { self.buckets[Self::bucket_idx(size)].free(ptr, size) }
+    unsafe fn free(&self, ptr: *mut u8, size: usize, generation: u64) {
+        unsafe { self.buckets[Self::bucket_idx(size)].free(ptr, size, generation) }
     }
 }
 
 static ALLOCATOR: LazyLock<BucketedFreeList> = LazyLock::new(BucketedFreeList::new);
 
-/// Allocate memory of at least the given size, returning a pointer to the allocation
-/// and the actual size allocated.
-pub fn allocate_pages_pooled(size: usize) -> (*mut u8, usize) {
-    ALLOCATOR.alloc(size)
+/// An owned block of pooled pages, returned to the pool when dropped.
+///
+/// The pages are read-write when handed out and may contain arbitrary bytes left over from a
+/// previous owner.
+///
+/// # Forking
+///
+/// On Linux the pages are shared (rather than private) mappings, which are not inherited by a
+/// `fork`ed child process. In a child, a `PooledPages` created before the `fork` therefore
+/// refers to memory that does not exist: accessing it faults or, worse, hits whatever has been
+/// mapped at the address since. [`PooledPages::is_valid`] tells these apart. Dropping such a
+/// block is fine, it is simply forgotten.
+pub struct PooledPages {
+    ptr: NonNull<u8>,
+    size: usize,
+    generation: u64,
 }
 
-/// Free the given allocation.
-///
-/// # Safety
-///
-/// - The pointer and size must identify a full allocation previously returned by
-///   [`allocate_pages_pooled`] and not already returned to the pool.
-/// - The caller must not retain any reference into the allocation after calling
-///   `free`; subsequent `alloc` calls may hand the same memory to another
-///   owner.
-pub unsafe fn free_pages_pooled(ptr: *mut u8, size: usize) {
-    unsafe { ALLOCATOR.free(ptr, size) }
+// Safety: this uniquely owns the memory it points to.
+unsafe impl Send for PooledPages {}
+unsafe impl Sync for PooledPages {}
+
+impl PooledPages {
+    /// Allocate pages with room for at least `size` bytes.
+    pub fn new(size: usize) -> Self {
+        let (ptr, size, generation) = ALLOCATOR.alloc(size);
+        Self {
+            ptr: NonNull::new(ptr).expect("the pooled allocation is never null"),
+            size,
+            generation,
+        }
+    }
+
+    /// The start of the pages.
+    pub fn as_ptr(&self) -> NonNull<u8> {
+        self.ptr
+    }
+
+    /// The actual size of the allocation, which is at least what was asked for.
+    pub fn len(&self) -> usize {
+        self.size
+    }
+
+    /// Whether the pages are still mapped in this process.
+    ///
+    /// This is `false` in a forked child for pages created before the fork. The pages must not
+    /// be accessed then.
+    #[inline]
+    pub fn is_valid(&self) -> bool {
+        self.generation == current_generation()
+    }
+}
+
+impl Drop for PooledPages {
+    fn drop(&mut self) {
+        unsafe { ALLOCATOR.free(self.ptr.as_ptr(), self.size, self.generation) }
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -295,16 +479,26 @@ pub unsafe fn allocate_pages(size_in_bytes: usize) -> Result<*mut u8, EbpfError>
             );
         }
         target_os = "linux" => {
+            // Shared mappings make `mprotect` cheaper, but are only sound to use if forks can be
+            // told apart (see `ForkTracker`).
+            let shared = FORK_TRACKER.is_some();
+            let flags = if shared {
+                libc::MAP_ANONYMOUS | libc::MAP_SHARED
+            } else {
+                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE
+            };
             libc_error_guard!(
                 mmap,
                 &mut raw,
                 size_in_bytes,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_ANONYMOUS | libc::MAP_SHARED,
+                flags,
                 -1,
                 0,
             );
-            libc_error_guard!(madvise, raw, size_in_bytes, libc::MADV_DONTFORK);
+            if shared {
+                libc_error_guard!(madvise, raw, size_in_bytes, libc::MADV_DONTFORK);
+            }
         }
         _ => {
             libc_error_guard!(
