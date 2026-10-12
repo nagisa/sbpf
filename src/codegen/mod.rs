@@ -2,23 +2,14 @@
 //!
 //! TODO: write some design philosphies here.
 
-// Everything here is used by the architecture specific backends, of which there may be none.
-#![cfg_attr(not(target_arch = "x86_64"), allow(dead_code, unused_imports))]
-
-#[cfg(all(feature = "codegen-debug", target_arch = "x86_64"))]
+#[cfg(feature = "codegen-debug")]
 pub mod debug;
-#[cfg(target_arch = "x86_64")]
 mod x64;
-#[cfg(target_arch = "x86_64")]
 use x64 as arch;
 
-#[cfg(target_arch = "x86_64")]
 mod generate;
-#[cfg(target_arch = "x86_64")]
 use arch::{TemplateRelocation, TemplateRelocationKind, MAX_RELOCATIONS};
-#[cfg(target_arch = "x86_64")]
 pub use generate::jit_templates;
-#[cfg(target_arch = "x86_64")]
 use generate::{Reg, TemplateBuilder, TemplateOpcode};
 
 use crate::ebpf;
@@ -90,14 +81,12 @@ fn finish_execution<C: ContextObject>(
     }
 }
 
-#[cfg(target_arch = "x86_64")]
 /// Interpret `executable`, starting at `vm.registers[11]`.
 pub fn interpret<C: ContextObject>(executable: &Executable<C>, vm: &mut EbpfVm<C>) {
     arch::enter(executable, None, vm)
 }
 
 impl JitProgram {
-    #[cfg(target_arch = "x86_64")]
     pub(crate) fn dynasm_invoke<C: ContextObject>(
         &self,
         executable: &Executable<C>,
@@ -360,7 +349,7 @@ impl<const SIZE: usize> JitTemplates<SIZE> {
         // so the last one may extend past the output.
         // `output_len` is below `NOOP_DUE`, see `analyze`, and the sizes are far from `usize::MAX`.
         let mut program = UnsealedJitProgram::new(pc_sec.len(), output_len.wrapping_add(SIZE));
-        #[cfg(all(feature = "codegen-debug", target_arch = "x86_64", target_os = "linux"))]
+        #[cfg(all(feature = "codegen-debug", target_os = "linux"))]
         debug::map_jit_text(&mut program, output_len);
 
         let text = program.text_section_mut();
@@ -414,7 +403,7 @@ impl<const SIZE: usize> JitTemplates<SIZE> {
         let mut program = program.seal(output_len)?;
         program.dynasm = true;
         program.random_key = random_key;
-        #[cfg(all(feature = "codegen-debug", target_arch = "x86_64", target_os = "linux"))]
+        #[cfg(all(feature = "codegen-debug", target_os = "linux"))]
         debug::finish_jit(self, executable, &mut program);
         Ok(program)
     }

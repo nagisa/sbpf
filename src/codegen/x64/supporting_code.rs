@@ -120,22 +120,17 @@ impl SupportingCode {
 
     fn generate() -> SupportingCode {
         // Addressed with absolute 32-bit addresses, so it has to be within the first 2 GiB.
-        #[cfg_attr(
-            not(all(feature = "codegen-debug", target_os = "linux")),
-            expect(unused_mut)
-        )]
-        let mut mapping =
+        let mapping =
             Mapping::low(Self::LEN).expect("failed to allocate memory for the supporting code");
-        #[cfg(all(feature = "codegen-debug", target_os = "linux"))]
-        let code_record = super::super::debug::CodeRecord::new("supports", &mut mapping, Self::LEN);
-        #[cfg_attr(
-            not(all(feature = "codegen-debug", target_os = "linux")),
-            expect(unused_mut)
-        )]
-        let mut supports = Self::assemble(mapping);
-        #[cfg(all(feature = "codegen-debug", target_os = "linux"))]
-        super::super::debug::finish_supporting_code(code_record, &mut supports);
-        supports
+        cfg_select! {
+            all(feature = "codegen-debug", target_os = "linux") => {
+                let mut mapping = mapping;
+                let code_record =
+                    super::super::debug::CodeRecord::new("supports", &mut mapping, Self::LEN);
+                super::super::debug::finish_supporting_code(code_record, Self::assemble(mapping))
+            }
+            _ => Self::assemble(mapping),
+        }
     }
 
     /// Assemble the supporting code into `mapping`, which it then runs from.

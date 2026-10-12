@@ -23,14 +23,12 @@
 //!   is expensive for large programs.
 
 use super::arch::SupportingCode;
-use super::generate::{self, Interpreter, InterpreterGenerator};
+use super::generate::{self, InterpreterGenerator};
 use super::{AuxTemplate, JitTemplates, TemplateOpcode};
 use crate::disassembler::disassemble_instruction;
 use crate::ebpf;
 use crate::elf::Executable;
-use crate::program::{
-    BuiltinProgram, FunctionRegistry, JitProgram, SBPFVersion, UnsealedJitProgram,
-};
+use crate::program::{BuiltinProgram, FunctionRegistry, JitProgram, SBPFVersion};
 use crate::static_analysis::DummyContextObject;
 use crate::vm::ContextObject;
 use std::collections::BTreeMap;
@@ -514,9 +512,11 @@ pub(super) use linux::{finish_interpreter, finish_jit, finish_supporting_code, m
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
+    use crate::codegen::generate::Interpreter;
     use crate::memory_management::{
         get_system_page_size, round_to_page_size, Access, Mapping, PagePermissions,
     };
+    use crate::program::UnsealedJitProgram;
     use std::fs::File;
     use std::os::fd::AsRawFd as _;
     use std::os::unix::fs::FileExt as _;
@@ -826,27 +826,29 @@ mod linux {
     /// Complete writing file containing the supporting code.
     pub(in crate::codegen) fn finish_supporting_code(
         mut record: CodeRecord,
-        supports: &mut SupportingCode,
-    ) {
+        mut supports: SupportingCode,
+    ) -> SupportingCode {
         let symbols = if record.is_on() {
-            supporting_code_symbols(supports).1
+            supporting_code_symbols(&supports).1
         } else {
             Vec::new()
         };
         record.finish(&mut supports.code, || symbols);
         record.keep_forever();
+        supports
     }
 
     /// Complete writing file containing the interpreter code.
     pub(in crate::codegen) fn finish_interpreter(
         mut record: CodeRecord,
         version: SBPFVersion,
-        interpreter: &mut Interpreter,
-    ) {
-        let Interpreter { steps, step_lens } = interpreter;
+        mut interpreter: Interpreter,
+    ) -> Interpreter {
+        let Interpreter { steps, step_lens } = &mut interpreter;
         let start = steps.as_ptr() as usize;
         record.finish(steps, || interpreter_symbols(version, start, step_lens));
         record.keep_forever();
+        interpreter
     }
 
     /// Map a file over the text pages of the new `program`, for its first `len` bytes of code.

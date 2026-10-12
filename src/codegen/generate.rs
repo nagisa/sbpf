@@ -598,11 +598,7 @@ fn generate_interpreter(version: SBPFVersion) -> Interpreter {
         }
     }
 
-    #[cfg_attr(
-        not(all(feature = "codegen-debug", target_os = "linux")),
-        expect(unused_mut)
-    )]
-    let mut interpreter = Interpreter {
+    let interpreter = Interpreter {
         steps: generator
             .buffer
             .protect()
@@ -611,7 +607,7 @@ fn generate_interpreter(version: SBPFVersion) -> Interpreter {
         step_lens: step_lens.into_boxed_slice(),
     };
     #[cfg(all(feature = "codegen-debug", target_os = "linux"))]
-    super::debug::finish_interpreter(code_record, version, &mut interpreter);
+    let interpreter = super::debug::finish_interpreter(code_record, version, interpreter);
     interpreter
 }
 

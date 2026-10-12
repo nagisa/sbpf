@@ -189,8 +189,7 @@ mod x86_64 {
     );
 }
 
-#[cfg(target_arch = "x86_64")]
-criterion::criterion_main!(x86_64::benches);
-
-#[cfg(not(target_arch = "x86_64"))]
-fn main() {}
+cfg_select! {
+    target_arch = "x86_64" => { criterion::criterion_main!(x86_64::benches); }
+    _ => { fn main() {} }
+}

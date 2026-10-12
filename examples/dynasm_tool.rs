@@ -365,10 +365,7 @@ mod tool {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
 fn main() {
-    tool::main()
+    #[cfg(target_arch = "x86_64")]
+    tool::main();
 }
-
-#[cfg(not(target_arch = "x86_64"))]
-fn main() {}
