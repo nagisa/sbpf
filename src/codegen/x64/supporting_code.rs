@@ -120,17 +120,18 @@ impl SupportingCode {
 
     fn generate() -> SupportingCode {
         // Addressed with absolute 32-bit addresses, so it has to be within the first 2 GiB.
-        let mapping =
-            Mapping::low(Self::LEN).expect("failed to allocate memory for the supporting code");
-        cfg_select! {
-            all(feature = "codegen-debug", target_os = "linux") => {
-                let mut mapping = mapping;
-                let code_record =
-                    super::super::debug::CodeRecord::new("supports", &mut mapping, Self::LEN);
-                super::super::debug::finish_supporting_code(code_record, Self::assemble(mapping))
-            }
-            _ => Self::assemble(mapping),
+        let builder = Mapping::builder(Self::LEN).low();
+        #[cfg(feature = "codegen-debug")]
+        let mut debug_image = super::super::debug::DebugImage::new("supports");
+        let mapping = cfg_select! {
+            feature = "codegen-debug" => debug_image.map(builder),
+            _ => builder.build(),
         }
+        .expect("failed to allocate memory for the supporting code");
+        let supports = Self::assemble(mapping);
+        #[cfg(feature = "codegen-debug")]
+        super::super::debug::finish_supporting_code(debug_image, &supports);
+        supports
     }
 
     /// Assemble the supporting code into `mapping`, which it then runs from.
@@ -140,7 +141,7 @@ impl SupportingCode {
         let (meter_exceeded, invalid_insn) = Self::signals(&mut out, base);
         let [call_internal_label, meter_checked, target_checked] =
             [(); 3].map(|()| out.new_dynamic_label());
-        #[cfg_attr(not(feature = "codegen-debug"), allow(unused_variables))]
+        #[cfg_attr(not(feature = "codegen-debug"), expect(unused_variables))]
         let call_internal = Self::call_internal(
             &mut out,
             base,
@@ -292,7 +293,7 @@ impl SupportingCode {
     }
 
     /// The `load`, `store_imm` and `store_reg` helpers.
-    #[allow(clippy::type_complexity)]
+    #[expect(clippy::type_complexity)]
     fn memory_accesses(
         out: &mut Asm,
         base: u32,

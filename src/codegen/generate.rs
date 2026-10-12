@@ -455,10 +455,10 @@ impl InterpreterGenerator {
         self.buffer.as_ptr()
     }
 
-    fn new(version: SBPFVersion) -> Self {
-        // Within the first 2 GiB, so that a backend may address it with absolute 32-bit addresses.
-        let buffer = Mapping::low(Self::STEP_TABLE_SIZE)
-            .expect("failed to allocate memory for the interpreter");
+    /// Generate into `buffer`, of `STEP_TABLE_SIZE` bytes within the first 2 GiB, so that a backend
+    /// may address the steps with absolute 32-bit addresses.
+    fn new(version: SBPFVersion, buffer: Mapping) -> Self {
+        assert_eq!(buffer.len(), Self::STEP_TABLE_SIZE);
         Self {
             version,
             buffer,
@@ -566,13 +566,16 @@ pub(super) fn interpreter(version: SBPFVersion) -> &'static Interpreter {
 }
 
 fn generate_interpreter(version: SBPFVersion) -> Interpreter {
-    let mut generator = InterpreterGenerator::new(version);
-    #[cfg(all(feature = "codegen-debug", target_os = "linux"))]
-    let code_record = super::debug::CodeRecord::new(
-        &format!("interpreter-{version:?}").to_lowercase(),
-        &mut generator.buffer,
-        InterpreterGenerator::STEP_TABLE_SIZE,
-    );
+    let builder = Mapping::builder(InterpreterGenerator::STEP_TABLE_SIZE).low();
+    #[cfg(feature = "codegen-debug")]
+    let mut debug_image =
+        super::debug::DebugImage::new(&format!("interpreter-{version:?}").to_lowercase());
+    let buffer = cfg_select! {
+        feature = "codegen-debug" => debug_image.map(builder),
+        _ => builder.build(),
+    }
+    .expect("failed to allocate memory for the interpreter");
+    let mut generator = InterpreterGenerator::new(version, buffer);
     // The space after the code of a step traps if it is ever executed.
     generator.buffer.fill(arch::TRAP_FILL);
     #[cfg(feature = "codegen-debug")]
@@ -606,8 +609,8 @@ fn generate_interpreter(version: SBPFVersion) -> Interpreter {
         #[cfg(feature = "codegen-debug")]
         step_lens: step_lens.into_boxed_slice(),
     };
-    #[cfg(all(feature = "codegen-debug", target_os = "linux"))]
-    let interpreter = super::debug::finish_interpreter(code_record, version, interpreter);
+    #[cfg(feature = "codegen-debug")]
+    super::debug::finish_interpreter(debug_image, version, &interpreter);
     interpreter
 }
 

@@ -15,9 +15,9 @@ use generate::{Reg, TemplateBuilder, TemplateOpcode};
 use crate::ebpf;
 use crate::elf::Executable;
 use crate::error::{EbpfError, ProgramResult};
+use crate::memory_management::Mapping;
 pub use crate::program::JitProgram;
-use crate::program::SBPFVersion;
-use crate::program::UnsealedJitProgram;
+use crate::program::{SBPFVersion, UnsealedJitProgram};
 use crate::vm::{ContextObject, EbpfVm};
 use rand::rngs::SmallRng;
 use rand::{thread_rng, Rng, RngCore, SeedableRng};
@@ -348,9 +348,16 @@ impl<const SIZE: usize> JitTemplates<SIZE> {
         // Templates are always written out in large chunks to employ SIMD and avoid memcpy calls,
         // so the last one may extend past the output.
         // `output_len` is below `NOOP_DUE`, see `analyze`, and the sizes are far from `usize::MAX`.
-        let mut program = UnsealedJitProgram::new(pc_sec.len(), output_len.wrapping_add(SIZE));
-        #[cfg(all(feature = "codegen-debug", target_os = "linux"))]
-        debug::map_jit_text(&mut program, output_len);
+        let code_capacity = output_len.wrapping_add(SIZE);
+        let len = UnsealedJitProgram::mapping_len(pc_sec.len(), code_capacity);
+        #[cfg(feature = "codegen-debug")]
+        let mut debug_image = debug::DebugImage::new_jit();
+        let mapping = cfg_select! {
+            feature = "codegen-debug" => debug_image.map(Mapping::builder(len))?,
+            _ => Mapping::pooled(len),
+        };
+        // The pc section is written in whole below, so the recycled memory need not be zeroed.
+        let mut program = UnsealedJitProgram::in_mapping(mapping, pc_sec.len(), code_capacity);
 
         let text = program.text_section_mut();
         let [invalid_call_target, sig_invalid_insn, sig_meter_exceeded] = self.shared_offsets();
@@ -403,8 +410,8 @@ impl<const SIZE: usize> JitTemplates<SIZE> {
         let mut program = program.seal(output_len)?;
         program.dynasm = true;
         program.random_key = random_key;
-        #[cfg(all(feature = "codegen-debug", target_os = "linux"))]
-        debug::finish_jit(self, executable, &mut program);
+        #[cfg(feature = "codegen-debug")]
+        debug::finish_jit(debug_image, self, executable, &mut program);
         Ok(program)
     }
 

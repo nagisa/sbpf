@@ -232,36 +232,51 @@ pub struct UnsealedJitProgram {
     pc_section: Mapping,
     /// The machine code.
     text_section: Mapping,
-    /// What the debugging aids keep of the code, see `codegen::debug`.
-    #[cfg(all(feature = "codegen-debug", target_arch = "x86_64", target_os = "linux"))]
-    pub(crate) code_record: Option<crate::codegen::debug::CodeRecord>,
 }
 
 impl UnsealedJitProgram {
     /// Allocate a program with `pc` zeroed entries in the pc section and room for `code_capacity`
-    /// bytes of machine code.
+    /// bytes of machine code, in pooled pages.
     pub fn new(pc: usize, code_capacity: usize) -> Self {
-        let page_size = get_system_page_size();
-        let pc_len = pc.saturating_mul(std::mem::size_of::<u32>());
-        let pc_size = round_to_page_size(pc_len, page_size);
-        let text_capacity = round_to_page_size(code_capacity, page_size);
-        let mapping = Mapping::pooled(pc_size.saturating_add(text_capacity));
-        let Ok([pc_section, text_section]) =
-            mapping.split([0..pc_len, pc_size..pc_size.saturating_add(text_capacity)])
-        else {
-            unreachable!("mapping split failed for some reason");
-        };
-        let mut program = Self {
-            pc_section,
-            text_section,
-            #[cfg(all(feature = "codegen-debug", target_arch = "x86_64", target_os = "linux"))]
-            code_record: None,
-        };
+        let mapping = Mapping::pooled(Self::mapping_len(pc, code_capacity));
+        let mut program = Self::in_mapping(mapping, pc, code_capacity);
         // The pc section relies on zero-initialization to distinguish unfilled forward-jump
         // targets from filled backward-jump targets in the old JIT. The pool may hand back
         // recycled memory. Zero just the pc section here.
         program.pc_section.fill(0);
         program
+    }
+
+    /// The length of the mapping of a program with `pc` entries in the pc section and room for
+    /// `code_capacity` bytes of machine code: the pc section, and the text section after it, each
+    /// in whole pages.
+    pub(crate) fn mapping_len(pc: usize, code_capacity: usize) -> usize {
+        let (_, pc_size, text_capacity) = Self::layout(pc, code_capacity);
+        pc_size.saturating_add(text_capacity)
+    }
+
+    /// A program with `pc` entries in the pc section and room for `code_capacity` bytes of machine
+    /// code in `mapping`, which must be at least `mapping_len` long. The pc section holds what the
+    /// mapping does.
+    pub(crate) fn in_mapping(mapping: Mapping, pc: usize, code_capacity: usize) -> Self {
+        let (pc_len, pc_size, text_capacity) = Self::layout(pc, code_capacity);
+        let text = pc_size..pc_size.saturating_add(text_capacity);
+        let Ok([pc_section, text_section]) = mapping.split([0..pc_len, text]) else {
+            panic!("the mapping of a program is shorter than its `mapping_len`");
+        };
+        Self {
+            pc_section,
+            text_section,
+        }
+    }
+
+    /// The length of the pc section, and the page-rounded lengths of both sections.
+    fn layout(pc: usize, code_capacity: usize) -> (usize, usize, usize) {
+        let page_size = get_system_page_size();
+        let pc_len = pc.saturating_mul(std::mem::size_of::<u32>());
+        let pc_size = round_to_page_size(pc_len, page_size);
+        let text_capacity = round_to_page_size(code_capacity, page_size);
+        (pc_len, pc_size, text_capacity)
     }
 
     /// Offset in `text_section` for each BPF instruction.
@@ -301,20 +316,12 @@ impl UnsealedJitProgram {
         &mut self.text_section
     }
 
-    /// The mapping of the text section, for `codegen::debug` to map a file over.
-    #[cfg(all(feature = "codegen-debug", target_arch = "x86_64", target_os = "linux"))]
-    pub(crate) fn text_mapping_mut(&mut self) -> &mut Mapping {
-        &mut self.text_section
-    }
-
     /// Make the pc section read-only and the text section, shrunk to the `used` length,
     /// executable.
     pub fn seal(self, used: usize) -> Result<JitProgram, EbpfError> {
         let Self {
             pc_section,
             mut text_section,
-            #[cfg(all(feature = "codegen-debug", target_arch = "x86_64", target_os = "linux"))]
-            code_record,
         } = self;
         if used > text_section.len() {
             return Err(EbpfError::ExhaustedTextSegment(used));
@@ -328,8 +335,8 @@ impl UnsealedJitProgram {
             text_section: text_section.protect()?,
             dynasm: false,
             random_key: 0,
-            #[cfg(all(feature = "codegen-debug", target_arch = "x86_64", target_os = "linux"))]
-            code_record,
+            #[cfg(all(feature = "codegen-debug", target_arch = "x86_64"))]
+            debug_registration: None,
         })
     }
 }
@@ -338,6 +345,10 @@ impl UnsealedJitProgram {
 ///
 /// See [`UnsealedJitProgram::seal`].
 pub struct JitProgram {
+    /// The registration of the code with debuggers, see `codegen::debug`. It is dropped first, so
+    /// that they forget the code before it is unmapped.
+    #[cfg(all(feature = "codegen-debug", target_arch = "x86_64"))]
+    pub(crate) debug_registration: Option<crate::codegen::debug::Registration>,
     /// Offset to each BPF instruction's machine code within `text_section`.
     pc_section: Mapping<Read>,
     /// The executable machine code.
@@ -351,18 +362,9 @@ pub struct JitProgram {
     // FIXME: could be shared with old jit for its own encryption key thing.
     #[cfg_attr(not(target_arch = "x86_64"), expect(dead_code))]
     pub(crate) random_key: u32,
-    /// What the debugging aids keep of the code, see `codegen::debug`.
-    #[cfg(all(feature = "codegen-debug", target_arch = "x86_64", target_os = "linux"))]
-    pub(crate) code_record: Option<crate::codegen::debug::CodeRecord>,
 }
 
 impl JitProgram {
-    /// The mapping of the text section, for `codegen::debug` to complete the file of.
-    #[cfg(all(feature = "codegen-debug", target_arch = "x86_64", target_os = "linux"))]
-    pub(crate) fn text_mapping_mut(&mut self) -> &mut Mapping<ReadExecute> {
-        &mut self.text_section
-    }
-
     /// Offset in `text_section` for each BPF instruction.
     #[inline]
     pub fn pc_section(&self) -> &[u32] {
@@ -389,15 +391,6 @@ impl JitProgram {
     /// The total pooled allocation size retained by the compiled program.
     pub fn mem_size(&self) -> usize {
         self.text_section.mapped_len()
-    }
-}
-
-impl Drop for JitProgram {
-    fn drop(&mut self) {
-        #[cfg(all(feature = "codegen-debug", target_arch = "x86_64", target_os = "linux"))]
-        if let Some(code_record) = self.code_record.take() {
-            code_record.release(&mut self.text_section);
-        }
     }
 }
 

@@ -37,7 +37,7 @@ dynasmrt = "5.1.0"
 object = { version = "0.40", optional = true, default-features = false, features = ["write_core", "elf"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Memory", "Win32_System_SystemInformation"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Memory", "Win32_System_SystemInformation"] }
 
 [target.'cfg(not(windows))'.dependencies]
 libc = "0.2"

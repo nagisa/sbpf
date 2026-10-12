@@ -195,7 +195,7 @@ mod tool {
             let executable = load(path, version);
             dynasm_compile(&executable);
             let program = executable.get_compiled_program().unwrap();
-            regions.push(debug::jit(&executable, &program, true));
+            regions.extend(debug::jit(&executable, &program, true));
         }
         debug::write_elf(&args.out, &regions)
             .unwrap_or_else(|e| die(format!("{}: {e}", args.out.display())));

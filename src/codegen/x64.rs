@@ -21,7 +21,6 @@ const R10: u8 = 10;
 const R11: u8 = 11;
 
 // Internal registers. Keep in sync with the `.alias`es in `x64asm!`.
-#[allow(unused)]
 const RINSN: u8 = RAX;
 const RTEMP: u8 = RCX;
 const RMETER: u8 = RDX;
