@@ -5,7 +5,7 @@ use super::arch::{self, MAX_JIT_TEMPLATE_SIZE};
 use super::{
     AuxTemplate, JitTemplates, TemplateLayout, TemplateRelocation, TemplateRelocationKind,
 };
-use crate::memory_management::{allocate_pages_low, protect_pages, PagePermissions};
+use crate::memory_management::{Mapping, ReadExecute};
 use crate::program::SBPFVersion;
 use dynasmrt::components::{LabelRegistry, PatchLoc, RelocRegistry};
 use dynasmrt::relocations::{Relocation, RelocationKind};
@@ -412,51 +412,16 @@ fn generate_jit_templates(version: SBPFVersion) -> JitTemplates<MAX_JIT_TEMPLATE
 /// The interpreter step for the instructions with `opcode`, of the interpreter for the SBPF
 /// `version`.
 pub(super) fn interpreter_step(version: SBPFVersion, opcode: TemplateOpcode) -> *const u8 {
-    let offset = InterpreterGenerator::step_offset(opcode);
-    // SAFETY:
-    //
-    // Contract from `<*mut u8>::add`: The offset in bytes, `count * size_of::<T>()`, computed on
-    // mathematical integers (without "wrapping around"), must fit in an `isize`.
-    //
-    // Contract from `<*mut u8>::add`: If the computed offset is non-zero, then `self` must be
-    // derived from a pointer to some allocation, and the entire memory range between `self` and the
-    // result must be in bounds of that allocation. In particular, this range must not "wrap around"
-    // the edge of the address space.
-    //
-    // Evidence: `buffer` is the allocation of `allocate_pages_low` of `STEP_TABLE_SIZE` bytes,
-    // which is `TemplateOpcode::COUNT` steps of `1 << STEP_SIZE_LOG2` bytes, and `offset` is the
-    // start of the step of an opcode, so less than that. It fits an `isize`, as the allocation
-    // does.
-    unsafe { interpreter(version).buffer.add(offset) }
+    &interpreter(version).steps[InterpreterGenerator::step_offset(opcode)]
 }
 
 pub(super) struct Interpreter {
-    pub(super) buffer: *mut u8,
+    /// The steps, which are never freed, as the interpreters are in a static.
+    pub(super) steps: Mapping<ReadExecute>,
     /// The length of the code of each step, which is followed by padding to the size of the step.
     #[cfg(feature = "codegen-debug")]
     pub(super) step_lens: Box<[u8]>,
 }
-
-// SAFETY:
-//
-// Contract from `Send`: Types that can be transferred across thread boundaries.
-//
-// Evidence: `buffer` is the only field that is not `Send` itself. It points to the steps, which are
-// read-execute and never freed once the `Interpreter` is constructed, so they can be used from any
-// thread.
-unsafe impl Send for Interpreter {}
-// SAFETY:
-//
-// Contract from `Sync`: Types for which it is safe to share references between threads.
-//
-// Contract from `Sync`: The precise definition is: a type `T` is `Sync` if and only if `&T` is
-// `Send`. In other words, if there is no possibility of undefined behavior (including data races)
-// when passing `&T` references between threads.
-//
-// Evidence: `&Interpreter` only gives access to `buffer`, the address of memory that is never
-// written to or freed once the `Interpreter` is constructed, and to `step_lens`, which is `Sync`,
-// so there is nothing to race on.
-unsafe impl Sync for Interpreter {}
 
 /// Generates the interpreter.
 ///
@@ -464,7 +429,7 @@ unsafe impl Sync for Interpreter {}
 /// `TemplateOpcode`, each running its instruction and then threading execution to the next one
 /// directly, thus implementing a technique known as direct threading.
 pub(super) struct InterpreterGenerator {
-    buffer: *mut u8,
+    buffer: Mapping,
     relocs: LabelRelocs<arch::Relocation>,
     offset: usize,
     version: SBPFVersion,
@@ -487,12 +452,12 @@ impl InterpreterGenerator {
 
     /// Where the steps start, for the generated code to dispatch to them.
     pub(super) fn base(&self) -> *const u8 {
-        self.buffer
+        self.buffer.as_ptr()
     }
 
     fn new(version: SBPFVersion) -> Self {
         // Within the first 2 GiB, so that a backend may address it with absolute 32-bit addresses.
-        let buffer = allocate_pages_low(Self::STEP_TABLE_SIZE)
+        let buffer = Mapping::low(Self::STEP_TABLE_SIZE)
             .expect("failed to allocate memory for the interpreter");
         Self {
             version,
@@ -513,43 +478,9 @@ impl Generator for InterpreterGenerator {
             .checked_sub(self.offset % step_capacity)
             .unwrap();
         assert!(buffer.len() <= remaining_capacity, "step is too long!");
-        assert!(self.offset.saturating_add(buffer.len()) <= Self::STEP_TABLE_SIZE);
-        // SAFETY:
-        //
-        // Contract from `<*mut u8>::add`: The offset in bytes, `count * size_of::<T>()`, computed
-        // on mathematical integers (without "wrapping around"), must fit in an `isize`.
-        //
-        // Contract from `<*mut u8>::add`: If the computed offset is non-zero, then `self` must be
-        // derived from a pointer to some allocation, and the entire memory range between `self` and
-        // the result must be in bounds of that allocation. In particular, this range must not "wrap
-        // around" the edge of the address space.
-        //
-        // Evidence: `buffer` is the allocation of `allocate_pages_low` of `STEP_TABLE_SIZE` bytes,
-        // and `offset` is at most `STEP_TABLE_SIZE`, per the assertion above. It fits an `isize`,
-        // as the allocation does.
-        let destination = unsafe { self.buffer.add(self.offset) };
-        // SAFETY:
-        //
-        // Contract from `ptr::copy_nonoverlapping`: `src` must be valid for reads of `count *
-        // size_of::<T>()` bytes or that number must be 0.
-        //
-        // Contract from `ptr::copy_nonoverlapping`: `dst` must be valid for writes of `count *
-        // size_of::<T>()` bytes or that number must be 0.
-        //
-        // Contract from `ptr::copy_nonoverlapping`: Both `src` and `dst` must be properly aligned.
-        //
-        // Contract from `ptr::copy_nonoverlapping`: The region of memory beginning at `src` with a
-        // size of `count * size_of::<T>()` bytes must *not* overlap with the region of memory
-        // beginning at `dst` with the same size.
-        //
-        // Evidence: `T` is `u8`, so the pointers are aligned, and the size is `buffer.len()` bytes.
-        // `buffer` is a slice, so valid for reads. The destination range ends within the
-        // `STEP_TABLE_SIZE` bytes of the allocation at `buffer`, per the assertion above, which is
-        // read-write until `generate_interpreter` protects it after the generation, and which
-        // nothing else accesses meanwhile. `buffer` is not of that allocation, which only `self`
-        // refers to, so the regions do not overlap.
-        unsafe { std::ptr::copy_nonoverlapping(buffer.as_ptr(), destination, buffer.len()) };
-        self.offset = self.offset.checked_add(buffer.len()).unwrap();
+        let end = self.offset.checked_add(buffer.len()).unwrap();
+        self.buffer[self.offset..end].copy_from_slice(buffer);
+        self.offset = end;
     }
 
     fn offset(&self) -> usize {
@@ -572,45 +503,11 @@ impl Generator for InterpreterGenerator {
             matches!(patch.relocation.kind(), RelocationKind::Relative),
             "unsupported relocation"
         );
-        let field = patch.range(0);
-        // SAFETY:
-        //
-        // Contract from `<*mut u8>::add`: The offset in bytes, `count * size_of::<T>()`, computed
-        // on mathematical integers (without "wrapping around"), must fit in an `isize`.
-        //
-        // Contract from `<*mut u8>::add`: If the computed offset is non-zero, then `self` must be
-        // derived from a pointer to some allocation, and the entire memory range between `self` and
-        // the result must be in bounds of that allocation. In particular, this range must not "wrap
-        // around" the edge of the address space.
-        //
-        // Contract from `slice::from_raw_parts_mut`: `data` must be non-null, valid for both reads
-        // and writes for `len * size_of::<T>()` many bytes, and it must be properly aligned. This
-        // means in particular: The entire memory range of this slice must be contained within a
-        // single allocation! Slices can never span across multiple allocations.
-        //
-        // Contract from `slice::from_raw_parts_mut`: `data` must point to `len` consecutive
-        // properly initialized values of type `T`.
-        //
-        // Contract from `slice::from_raw_parts_mut`: The memory referenced by the returned slice
-        // must not be accessed through any other pointer (not derived from the return value) for
-        // the duration of lifetime `'a`. Both read and write accesses are forbidden.
-        //
-        // Contract from `slice::from_raw_parts_mut`: The total size `len * size_of::<T>()` of the
-        // slice must be no larger than `isize::MAX`, and adding that size to `data` must not "wrap
-        // around" the address space. See the safety documentation of `pointer::offset`.
-        //
-        // Evidence: `T` is `u8`, so the pointer is aligned, and the size is that of the field,
-        // which is within the instruction that `extend` has just written into the
-        // `STEP_TABLE_SIZE` bytes of the allocation of `allocate_pages_low` at `buffer`, so
-        // the offset is within it and fits an `isize`. `generate_interpreter` filled the
-        // allocation with `arch::TRAP_FILL`, so it is initialized, and it is read-write
-        // until `generate_interpreter` protects it after the generation.
-        // Nothing else accesses it while the slice lives, which ends at the end of this function.
-        let field =
-            unsafe { std::slice::from_raw_parts_mut(self.buffer.add(field.start), field.len()) };
-        let target = target.wrapping_sub(self.buffer as usize);
+        let base = self.buffer.as_ptr() as usize;
+        let field = &mut self.buffer[patch.range(0)];
+        let target = target.wrapping_sub(base);
         patch
-            .patch(field, self.buffer as usize, target)
+            .patch(field, base, target)
             .expect("global label out of reach of the interpreter");
     }
 
@@ -671,44 +568,13 @@ pub(super) fn interpreter(version: SBPFVersion) -> &'static Interpreter {
 fn generate_interpreter(version: SBPFVersion) -> Interpreter {
     let mut generator = InterpreterGenerator::new(version);
     #[cfg(all(feature = "codegen-debug", target_os = "linux"))]
-    // SAFETY:
-    //
-    // Contract from `CodeRecord::new`: The `len` bytes at `start` must be pages of a mapping that
-    // the caller owns.
-    //
-    // Contract from `CodeRecord::new`: Nothing may access these pages while this runs, or rely on
-    // what they held before: they are replaced with a mapping that stays until `release`.
-    //
-    // Evidence: the range is the allocation of `allocate_pages_low` of `STEP_TABLE_SIZE` bytes,
-    // which `generator` just made, and which nothing else refers to. Nothing was written to it yet,
-    // and the steps are generated into it afterwards. The mapping stays, as the interpreter is
-    // never freed.
-    let code_record = unsafe {
-        super::debug::CodeRecord::new(
-            &format!("interpreter-{version:?}").to_lowercase(),
-            generator.buffer as usize,
-            InterpreterGenerator::STEP_TABLE_SIZE,
-        )
-    };
+    let code_record = super::debug::CodeRecord::new(
+        &format!("interpreter-{version:?}").to_lowercase(),
+        &mut generator.buffer,
+        InterpreterGenerator::STEP_TABLE_SIZE,
+    );
     // The space after the code of a step traps if it is ever executed.
-    //
-    // SAFETY:
-    //
-    // Contract from `ptr::write_bytes`: `dst` must be valid for writes of `count * size_of::<T>()`
-    // bytes.
-    //
-    // Contract from `ptr::write_bytes`: `dst` must be properly aligned.
-    //
-    // Evidence: `T` is `u8`, so the pointer is aligned, and the size is `STEP_TABLE_SIZE` bytes,
-    // which is the read-write allocation of `allocate_pages_low` at `generator.buffer`. Nothing
-    // else accesses it meanwhile.
-    unsafe {
-        std::ptr::write_bytes(
-            generator.buffer,
-            arch::TRAP_FILL,
-            InterpreterGenerator::STEP_TABLE_SIZE,
-        )
-    };
+    generator.buffer.fill(arch::TRAP_FILL);
     #[cfg(feature = "codegen-debug")]
     let mut step_lens = vec![0; TemplateOpcode::COUNT];
     for opcode in TemplateOpcode::all() {
@@ -724,40 +590,7 @@ fn generate_interpreter(version: SBPFVersion) -> Interpreter {
             "step for {:#x} is too long",
             opcode.0
         );
-        // SAFETY:
-        //
-        // Contract from `<*mut u8>::add`: The offset in bytes, `count * size_of::<T>()`, computed
-        // on mathematical integers (without "wrapping around"), must fit in an `isize`.
-        //
-        // Contract from `<*mut u8>::add`: If the computed offset is non-zero, then `self` must be
-        // derived from a pointer to some allocation, and the entire memory range between `self` and
-        // the result must be in bounds of that allocation. In particular, this range must not "wrap
-        // around" the edge of the address space.
-        //
-        // Contract from `slice::from_raw_parts_mut`: `data` must be non-null, valid for both reads
-        // and writes for `len * size_of::<T>()` many bytes, and it must be properly aligned. This
-        // means in particular: The entire memory range of this slice must be contained within a
-        // single allocation! Slices can never span across multiple allocations.
-        //
-        // Contract from `slice::from_raw_parts_mut`: `data` must point to `len` consecutive
-        // properly initialized values of type `T`.
-        //
-        // Contract from `slice::from_raw_parts_mut`: The memory referenced by the returned slice
-        // must not be accessed through any other pointer (not derived from the return value) for
-        // the duration of lifetime `'a`. Both read and write accesses are forbidden.
-        //
-        // Contract from `slice::from_raw_parts_mut`: The total size `len * size_of::<T>()` of the
-        // slice must be no larger than `isize::MAX`, and adding that size to `data` must not "wrap
-        // around" the address space. See the safety documentation of `pointer::offset`.
-        //
-        // Evidence: `T` is `u8`, so the pointer is aligned, and the size is `step_len` bytes. The
-        // step is within the `STEP_TABLE_SIZE` bytes of the allocation of `allocate_pages_low` at
-        // `generator.buffer`, as `extend` asserts for the code written into it, so the offset is
-        // within it and fits an `isize`. It is initialized, as the allocation was filled with
-        // `arch::TRAP_FILL` above, and it is read-write until it is protected below. Nothing else
-        // accesses it while the slice lives, which ends with `resolve`.
-        let step =
-            unsafe { std::slice::from_raw_parts_mut(generator.buffer.add(step_start), step_len) };
+        let step = &mut generator.buffer[step_start..generator.offset];
         generator.relocs.resolve(step, step_start);
         #[cfg(feature = "codegen-debug")]
         {
@@ -765,34 +598,21 @@ fn generate_interpreter(version: SBPFVersion) -> Interpreter {
         }
     }
 
-    #[cfg(feature = "codegen-debug")]
-    let step_lens = step_lens.into_boxed_slice();
-    #[cfg(all(feature = "codegen-debug", target_os = "linux"))]
-    super::debug::finish_interpreter(code_record, version, generator.buffer, &step_lens);
-
-    // SAFETY:
-    //
-    // Contract from `protect_pages`: These pages must be of an allocation that the caller owns.
-    //
-    // Contract from `protect_pages`: While `permissions` apply, nothing may access these pages in a
-    // way that `permissions` do not allow.
-    //
-    // Evidence: the pages are the allocation of `allocate_pages_low` of `STEP_TABLE_SIZE` bytes,
-    // which `generator` made, and which the interpreter keeps forever. The steps are only executed,
-    // and read by `codegen::debug`, afterwards.
-    unsafe {
-        protect_pages(
-            generator.buffer,
-            InterpreterGenerator::STEP_TABLE_SIZE,
-            PagePermissions::ReadExecute,
-        )
-    }
-    .expect("failed to make the interpreter executable");
-    Interpreter {
-        buffer: generator.buffer,
+    #[cfg_attr(
+        not(all(feature = "codegen-debug", target_os = "linux")),
+        expect(unused_mut)
+    )]
+    let mut interpreter = Interpreter {
+        steps: generator
+            .buffer
+            .protect()
+            .expect("failed to make the interpreter executable"),
         #[cfg(feature = "codegen-debug")]
-        step_lens,
-    }
+        step_lens: step_lens.into_boxed_slice(),
+    };
+    #[cfg(all(feature = "codegen-debug", target_os = "linux"))]
+    super::debug::finish_interpreter(code_record, version, &mut interpreter);
+    interpreter
 }
 
 #[cfg(test)]

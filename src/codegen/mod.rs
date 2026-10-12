@@ -361,7 +361,7 @@ impl<const SIZE: usize> JitTemplates<SIZE> {
         // `output_len` is below `NOOP_DUE`, see `analyze`, and the sizes are far from `usize::MAX`.
         let mut program = UnsealedJitProgram::new(pc_sec.len(), output_len.wrapping_add(SIZE));
         #[cfg(all(feature = "codegen-debug", target_arch = "x86_64", target_os = "linux"))]
-        debug::map_jit_text(&mut program);
+        debug::map_jit_text(&mut program, output_len);
 
         let text = program.text_section_mut();
         let [invalid_call_target, sig_invalid_insn, sig_meter_exceeded] = self.shared_offsets();

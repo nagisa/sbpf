@@ -1034,7 +1034,7 @@ pub(super) fn enter<C: ContextObject>(
                 bpf.as_ptr()
                     .wrapping_add(pc.wrapping_add(1).wrapping_mul(ebpf::INSN_SIZE)),
                 std::ptr::null(),
-                generate::interpreter(version).buffer.cast_const(),
+                generate::interpreter(version).steps.as_ptr(),
             )
         }
     };

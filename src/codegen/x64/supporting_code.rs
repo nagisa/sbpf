@@ -2,7 +2,7 @@
 //! executable memory, and the host functions it calls into.
 
 use super::*;
-use crate::memory_management::{allocate_pages_low, protect_pages, PagePermissions};
+use crate::memory_management::{Mapping, ReadExecute};
 use dynasmrt::x64::X64Relocation;
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, VecAssembler};
 use std::sync::LazyLock;
@@ -44,6 +44,9 @@ pub(in crate::codegen) struct SupportingCode {
     /// The addresses of all the generated code.
     #[cfg(feature = "codegen-debug")]
     code_range: std::ops::Range<u32>,
+    /// The memory the code is in, which is never freed, as the supporting code is in a static.
+    #[cfg_attr(not(feature = "codegen-debug"), expect(dead_code))]
+    pub(in crate::codegen) code: Mapping<ReadExecute>,
 }
 
 type Asm = VecAssembler<X64Relocation>;
@@ -117,63 +120,27 @@ impl SupportingCode {
 
     fn generate() -> SupportingCode {
         // Addressed with absolute 32-bit addresses, so it has to be within the first 2 GiB.
-        let buffer = allocate_pages_low(Self::LEN)
-            .expect("failed to allocate memory for the supporting code");
+        #[cfg_attr(
+            not(all(feature = "codegen-debug", target_os = "linux")),
+            expect(unused_mut)
+        )]
+        let mut mapping =
+            Mapping::low(Self::LEN).expect("failed to allocate memory for the supporting code");
         #[cfg(all(feature = "codegen-debug", target_os = "linux"))]
-        // SAFETY:
-        //
-        // Contract from `CodeRecord::new`: The `len` bytes at `start` must be pages of a mapping
-        // that the caller owns.
-        //
-        // Contract from `CodeRecord::new`: Nothing may access these pages while this runs, or rely
-        // on what they held before: they are replaced with a mapping that stays until `release`.
-        //
-        // Evidence: the range is the allocation of `allocate_pages_low` of `LEN` bytes just made,
-        // which nothing else refers to. Nothing was written to it yet, and the code is copied into
-        // it afterwards. The mapping stays, as the supporting code is never freed.
-        let code_record =
-            unsafe { super::super::debug::CodeRecord::new("supports", buffer as usize, Self::LEN) };
-        let base_addr = u32::try_from(buffer.expose_provenance()).unwrap();
-        let (supports, code) = Self::assemble(base_addr);
-        assert!(code.len() <= Self::LEN, "supporting code is too long!");
-        // SAFETY:
-        //
-        // Contract from `ptr::copy_nonoverlapping`: `src` must be valid for reads of `count *
-        // size_of::<T>()` bytes or that number must be 0.
-        //
-        // Contract from `ptr::copy_nonoverlapping`: `dst` must be valid for writes of `count *
-        // size_of::<T>()` bytes or that number must be 0.
-        //
-        // Contract from `ptr::copy_nonoverlapping`: Both `src` and `dst` must be properly aligned.
-        //
-        // Contract from `ptr::copy_nonoverlapping`: The region of memory beginning at `src` with a
-        // size of `count * size_of::<T>()` bytes must *not* overlap with the region of memory
-        // beginning at `dst` with the same size.
-        //
-        // Evidence: `T` is `u8`, so the pointers are aligned, and the size is `code.len()` bytes.
-        // `code` is a `Vec`, so valid for reads, and not of the read-write allocation of
-        // `allocate_pages_low` at `buffer`, which `code.len()` was asserted to fit, and which
-        // nothing else accesses meanwhile, so the regions do not overlap.
-        unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), buffer, code.len()) };
+        let code_record = super::super::debug::CodeRecord::new("supports", &mut mapping, Self::LEN);
+        #[cfg_attr(
+            not(all(feature = "codegen-debug", target_os = "linux")),
+            expect(unused_mut)
+        )]
+        let mut supports = Self::assemble(mapping);
         #[cfg(all(feature = "codegen-debug", target_os = "linux"))]
-        super::super::debug::finish_supporting_code(code_record, &supports);
-        // SAFETY:
-        //
-        // Contract from `protect_pages`: These pages must be of an allocation that the caller owns.
-        //
-        // Contract from `protect_pages`: While `permissions` apply, nothing may access these pages
-        // in a way that `permissions` do not allow.
-        //
-        // Evidence: the pages are the allocation of `allocate_pages_low` of `LEN` bytes, which the
-        // supporting code keeps forever. It is only executed, and read by `codegen::debug`,
-        // afterwards.
-        unsafe { protect_pages(buffer, Self::LEN, PagePermissions::ReadExecute) }
-            .expect("failed to make the supporting code executable");
+        super::super::debug::finish_supporting_code(code_record, &mut supports);
         supports
     }
 
-    /// Assemble the supporting code to run from the address `base`.
-    fn assemble(base: u32) -> (SupportingCode, Vec<u8>) {
+    /// Assemble the supporting code into `mapping`, which it then runs from.
+    fn assemble(mut mapping: Mapping) -> SupportingCode {
+        let base = u32::try_from(mapping.as_ptr() as usize).unwrap();
         let mut out = Asm::new(usize::try_from(base).unwrap());
         let (meter_exceeded, invalid_insn) = Self::signals(&mut out, base);
         let [call_internal_label, meter_checked, target_checked] =
@@ -190,30 +157,43 @@ impl SupportingCode {
         let v0_call_imm = Self::v0_call_imm(&mut out, base, meter_checked);
         let (v0_callx, callx) = Self::callx(&mut out, base, call_internal_label);
         let (load, store_imm, store_reg) = Self::memory_accesses(&mut out, base);
-        let supports = Self {
+        let syscall = Self::syscall(&mut out, base);
+        #[cfg(feature = "tracer")]
+        let trace = Self::trace(&mut out, base);
+        let entry_point = Self::entry_point(&mut out, base);
+        let divide = Self::divides(&mut out, base);
+        #[cfg(feature = "codegen-debug")]
+        let code_range = base..base.wrapping_add(u32::try_from(out.offset().0).unwrap());
+        let code = out
+            .finalize()
+            .expect("failed to resolve the supporting code");
+        mapping
+            .get_mut(..code.len())
+            .expect("supporting code is too long!")
+            .copy_from_slice(&code);
+        Self {
             #[cfg(feature = "codegen-debug")]
             call_internal,
             call_imm,
             callx,
             v0_call_imm,
             v0_callx,
-            syscall: Self::syscall(&mut out, base),
+            syscall,
             #[cfg(feature = "tracer")]
-            trace: Self::trace(&mut out, base),
+            trace,
             load,
             store_imm,
             store_reg,
-            entry_point: Self::entry_point(&mut out, base),
+            entry_point,
             meter_exceeded,
             invalid_insn,
-            divide: Self::divides(&mut out, base),
+            divide,
             #[cfg(feature = "codegen-debug")]
-            code_range: base..base.wrapping_add(u32::try_from(out.offset().0).unwrap()),
-        };
-        let code = out
-            .finalize()
-            .expect("failed to resolve the supporting code");
-        (supports, code)
+            code_range,
+            code: mapping
+                .protect()
+                .expect("failed to make the supporting code executable"),
+        }
     }
 
     /// The internal call to the host address of the target instruction in `rax`, from the

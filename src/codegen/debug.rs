@@ -23,7 +23,7 @@
 //!   is expensive for large programs.
 
 use super::arch::SupportingCode;
-use super::generate::{self, InterpreterGenerator};
+use super::generate::{self, Interpreter, InterpreterGenerator};
 use super::{AuxTemplate, JitTemplates, TemplateOpcode};
 use crate::disassembler::disassemble_instruction;
 use crate::ebpf;
@@ -150,18 +150,8 @@ pub fn supporting_code() -> Region {
 /// If `codegen` does not support `version`.
 pub fn interpreter(version: SBPFVersion) -> Region {
     let interpreter = generate::interpreter(version);
-    let start = interpreter.buffer as usize;
-    // SAFETY:
-    //
-    // Contract from `read_memory`: `start` must be non-null, and the `len` bytes at it must be
-    // readable and initialized, within a single allocation.
-    //
-    // Contract from `read_memory`: Nothing may write to these bytes while this runs.
-    //
-    // Evidence: `buffer` is the allocation of `allocate_pages_low` of `STEP_TABLE_SIZE` bytes that
-    // `generate::interpreter` generated in full, so non-null and initialized, which is
-    // read-execute and never written to or freed afterwards.
-    let bytes = unsafe { read_memory(start, InterpreterGenerator::STEP_TABLE_SIZE) };
+    let start = interpreter.steps.as_ptr() as usize;
+    let bytes = interpreter.steps.to_vec();
     Region {
         name: format!(".text.interpreter_{}", version_name(version)),
         start,
@@ -245,49 +235,9 @@ fn sized_symbols(mut named: Vec<(String, usize)>, end: usize) -> Vec<Symbol> {
     symbols
 }
 
-/// Copy `len` bytes of memory at `start`.
-///
-/// # Safety
-///
-/// - `start` must be non-null, and the `len` bytes at it must be readable and initialized, within
-///   a single allocation.
-/// - Nothing may mutate the pointee while this runs.
-unsafe fn read_memory(start: usize, len: usize) -> Vec<u8> {
-    // SAFETY:
-    //
-    // Contract from `slice::from_raw_parts`: `data` must be non-null, valid for reads for `len *
-    // size_of::<T>()` many bytes, and it must be properly aligned. This means in particular: The
-    // entire memory range of this slice must be contained within a single allocation! Slices can
-    // never span across multiple allocations.
-    //
-    // Contract from `slice::from_raw_parts`: `data` must point to `len` consecutive properly
-    // initialized values of type `T`.
-    //
-    // Contract from `slice::from_raw_parts`: The memory referenced by the returned slice must not
-    // be mutated for the duration of lifetime `'a`, except inside an `UnsafeCell`.
-    //
-    // Contract from `slice::from_raw_parts`: The total size `len * size_of::<T>()` of the slice
-    // must be no larger than `isize::MAX`, and adding that size to `data` must not "wrap around"
-    // the address space. See the safety documentation of `pointer::offset`.
-    //
-    // Evidence: `T` is `u8`, so the pointer is aligned. The rest is delegated to the callers of
-    // this function.
-    unsafe { std::slice::from_raw_parts(start as *const u8, len) }.to_vec()
-}
-
 fn supporting_code_region(supports: &SupportingCode) -> Region {
     let (range, symbols) = supporting_code_symbols(supports);
-    // SAFETY:
-    //
-    // Contract from `read_memory`: `start` must be non-null, and the `len` bytes at it must be
-    // readable and initialized, within a single allocation.
-    //
-    // Contract from `read_memory`: Nothing may write to these bytes while this runs.
-    //
-    // Evidence: the range is the code that `SupportingCode` generated at the start of its
-    // allocation of `allocate_pages_low`, so non-null and initialized, which is read-execute and
-    // never written to or freed afterwards.
-    let bytes = unsafe { read_memory(range.start, range.len()) };
+    let bytes = supports.code[..range.len()].to_vec();
     Region {
         name: ".text.supports".to_string(),
         start: range.start,
@@ -564,7 +514,9 @@ pub(super) use linux::{finish_interpreter, finish_jit, finish_supporting_code, m
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
-    use crate::memory_management::{get_system_page_size, PagePermissions};
+    use crate::memory_management::{
+        get_system_page_size, round_to_page_size, Access, Mapping, PagePermissions,
+    };
     use std::fs::File;
     use std::os::fd::AsRawFd as _;
     use std::os::unix::fs::FileExt as _;
@@ -589,49 +541,34 @@ mod linux {
     }
 
     impl CodeRecord {
-        /// Start the record of the code of `label`, which is going to be generated into the `len`
-        /// bytes at `start`. With `Options::code_dir`, that is a file there mapped over them, so
-        /// that what is written there is written to the file.
+        /// Start the record of the code of `label`, which is going to be generated into the first
+        /// `len` bytes of `mapping`, and the rest of their last page. With `Options::code_dir`,
+        /// that is a file there mapped over them, so that what is written there is written to the
+        /// file. The pages hold zeroes afterwards.
         ///
         /// # Panics
         ///
-        /// If the file cannot be created or mapped, as there is no sensible fallback for a debug
-        /// feature that is asked for.
-        ///
-        /// # Safety
-        ///
-        /// - The `len` bytes at `start` must be pages of a mapping that the caller owns.
-        /// - Nothing may access these pages while this runs, or rely on what they held before:
-        ///   they are replaced with a mapping that stays until `release`.
-        pub(in crate::codegen) unsafe fn new(label: &str, start: usize, len: usize) -> CodeRecord {
-            // SAFETY:
-            //
-            // Contract from `CodeRecord::new_in`: The `len` bytes at `start` must be pages of a
-            // mapping that the caller owns.
-            //
-            // Contract from `CodeRecord::new_in`: Nothing may access these pages while this runs,
-            // or rely on what they held before: they are replaced with a mapping that stays until
-            // `release`.
-            //
-            // Evidence: the same contract as this function's.
-            unsafe { Self::new_in(options().code_dir.as_deref(), label, start, len) }
+        /// If `len` is beyond `mapping`, or the file cannot be created or mapped, as there is no
+        /// sensible fallback for a debug feature that is asked for.
+        pub(in crate::codegen) fn new(
+            label: &str,
+            mapping: &mut Mapping,
+            len: usize,
+        ) -> CodeRecord {
+            Self::new_in(options().code_dir.as_deref(), label, mapping, len)
         }
 
         /// `new`, with the file in `code_dir` rather than in `Options::code_dir`.
-        ///
-        /// # Safety
-        ///
-        /// - The `len` bytes at `start` must be pages of a mapping that the caller owns.
-        /// - Nothing may access these pages while this runs, or rely on what they held before:
-        ///   they are replaced with a mapping that stays until `release`.
-        pub(super) unsafe fn new_in(
+        pub(super) fn new_in(
             code_dir: Option<&Path>,
             label: &str,
-            start: usize,
+            mapping: &mut Mapping,
             len: usize,
         ) -> CodeRecord {
             assert_eq!(get_system_page_size(), PAGE_ALIGNMENT);
-            assert!(start.is_multiple_of(PAGE_ALIGNMENT) && len.is_multiple_of(PAGE_ALIGNMENT));
+            assert!(len <= mapping.len(), "{} is beyond its mapping", label);
+            let start = mapping.as_ptr() as usize;
+            let len = round_to_page_size(len, PAGE_ALIGNMENT);
             let section = format!(".text.{label}");
             let Some(directory) = code_dir else {
                 return CodeRecord {
@@ -672,9 +609,10 @@ mod linux {
             // will be discarded. If the specified address cannot be used, mmap() will fail.
             //
             // Evidence: the part of the existing mappings that is discarded is the `len` bytes at
-            // `start`, which the contract of `new_in` has be pages of a mapping that the caller owns,
-            // which nothing accesses while this runs, or relies on the content of. Accesses
-            // afterwards are to the new mapping, which is read-write like the memory it replaces.
+            // `start`, which are the pages of the first bytes of `mapping`, which no other
+            // `Mapping` has bytes in. `mapping` is borrowed exclusively, so nothing accesses them
+            // while this runs, and it has them read-write, as the new mapping is. Their bytes are
+            // initialized afterwards, as the file is zeroes there.
             let mapped = unsafe {
                 libc::mmap(
                     start as *mut libc::c_void,
@@ -700,36 +638,32 @@ mod linux {
             }
         }
 
-        /// Complete the record, once the code is final: the file gets the headers and the
-        /// `symbols`, and the code is registered with the GDB JIT interface.
+        /// Complete the record, once the code in `mapping` is final: the file gets the headers
+        /// and the `symbols`, and the code is registered with the GDB JIT interface.
         ///
-        /// The mapping is then replaced with a private one of the same content and the
-        /// `permissions`, as debuggers cannot insert breakpoints into shared mappings. So the code
-        /// must not be written to afterwards, which the file would not have.
-        pub(in crate::codegen) fn finish(
+        /// The mapping of the file is then replaced with a private one of the same content and
+        /// the permissions `A`, as debuggers cannot insert breakpoints into shared mappings. So the
+        /// code must not be written to afterwards, which the file would not have.
+        ///
+        /// # Panics
+        ///
+        /// If `mapping` is not where the record is.
+        pub(in crate::codegen) fn finish<A: Access>(
             &mut self,
+            mapping: &mut Mapping<A>,
             symbols: impl FnOnce() -> Vec<Symbol>,
-            permissions: PagePermissions,
-        ) {
+        ) where
+            Mapping<A>: std::ops::Deref<Target = [u8]>,
+        {
             assert!(self.registration.is_none(), "{} is finished", self.section);
-            let gdb_jit = options().gdb_jit;
-            if self.file.is_none() && !gdb_jit {
+            self.check(mapping);
+            if !self.is_on() {
                 return;
             }
-            // SAFETY:
-            //
-            // Contract from `read_memory`: `start` must be non-null, and the `len` bytes at it must
-            // be readable and initialized, within a single allocation.
-            //
-            // Contract from `read_memory`: Nothing may write to these bytes while this runs.
-            //
-            // Evidence: the range is the one given to `new_in`, which the contract of `new_in` has
-            // be pages of a mapping that the caller owns, so non-null and readable, and
-            // initialized as mapped memory is. The code is final when `finish` is called, and
-            // nothing writes to it meanwhile: the records of the supporting code and of the
-            // interpreters are finished while they are generated, and that of a `JitProgram` once
-            // it is sealed but before `compile` returns it, through `&mut`.
-            let code = unsafe { read_memory(self.start, self.len) };
+            // The rest of the last page is not accessible through `mapping`, and holds the traps
+            // that `JitProgram::seal` fills it with, if it has code.
+            let mut code = mapping.to_vec();
+            code.resize(self.len, super::super::arch::TRAP_FILL);
             let image = elf_image(&[Region {
                 name: self.section.clone(),
                 start: self.start,
@@ -744,11 +678,7 @@ mod linux {
                 // The code in the file is what is written there, as it is mapped there.
                 file.write_all_at(&image, 0)
                     .unwrap_or_else(|error| panic!("failed to write {:?}: {}", path, error));
-                let prot = match permissions {
-                    PagePermissions::Read => libc::PROT_READ,
-                    PagePermissions::ReadWrite => libc::PROT_READ | libc::PROT_WRITE,
-                    PagePermissions::ReadExecute => libc::PROT_READ | libc::PROT_EXEC,
-                };
+                let prot = prot(A::PERMISSIONS);
                 // SAFETY:
                 //
                 // Contract from calling `libc::mmap`: none documented. As for any foreign
@@ -764,14 +694,13 @@ mod linux {
                 // the overlapped part of the existing mapping(s) will be discarded. If the
                 // specified address cannot be used, mmap() will fail.
                 //
-                // Evidence: the part of the existing mappings that is discarded is the mapping
-                // of the file that `new_in` made, which the contract of `new_in` has be the
-                // record's until `release`. Nothing accesses it meanwhile: the records of the
-                // supporting code and of the interpreters are finished while they are generated,
-                // and that of a `JitProgram` once it is sealed but before `compile` returns it,
-                // through `&mut`. Accesses afterwards are to the new mapping, with the bytes of
-                // the file, which are those of the code, and the `permissions` that the code
-                // needs.
+                // Evidence: the part of the existing mappings that is discarded is the `len` bytes
+                // at `start`, which `check` found to be the pages of `mapping`, which no other
+                // `Mapping` has bytes in. `mapping` is borrowed exclusively, so nothing accesses
+                // them while this runs. Accesses afterwards are to the new mapping, with the bytes
+                // of the file, which are those that were in `mapping`, as it was mapped there and
+                // the code there was written above as it was, and with the permissions `A` of
+                // `mapping`.
                 let mapped = unsafe {
                     libc::mmap(
                         self.start as *mut libc::c_void,
@@ -789,7 +718,7 @@ mod linux {
                     io::Error::last_os_error()
                 );
             }
-            if gdb_jit {
+            if options().gdb_jit {
                 self.registration = Some(register(image.into_boxed_slice()));
             }
         }
@@ -802,14 +731,16 @@ mod linux {
 
         /// Tell the debuggers that the code is gone, and replace the mapping of the file with
         /// anonymous memory, so that the file stays as it was when the memory is used for
-        /// something else.
+        /// something else. The pages of `mapping` hold zeroes afterwards.
         ///
-        /// # Safety
+        /// # Panics
         ///
-        /// - The `len` bytes at `start` given to `new` must still be pages that the caller owns.
-        /// - Nothing may access these pages while this runs, or rely on what they held before:
-        ///   they are replaced with an anonymous mapping.
-        pub(crate) unsafe fn release(mut self) {
+        /// If `mapping` is not where the record is.
+        pub(crate) fn release<A: Access>(mut self, mapping: &mut Mapping<A>)
+        where
+            Mapping<A>: std::ops::Deref<Target = [u8]>,
+        {
+            self.check(mapping);
             self.unregister();
             let Some((_, path)) = &self.file else {
                 return;
@@ -829,15 +760,15 @@ mod linux {
             // will be discarded. If the specified address cannot be used, mmap() will fail.
             //
             // Evidence: the part of the existing mappings that is discarded is the `len` bytes at
-            // `start`, which the contract of `release` has still be pages that the caller owns,
-            // which nothing accesses while this runs, or relies on the content of afterwards.
-            // Accesses afterwards are to the new mapping, which is read-write like the memory of
-            // the pool that it returns to.
+            // `start`, which `check` found to be the pages of `mapping`, which no other `Mapping`
+            // has bytes in. `mapping` is borrowed exclusively, so nothing accesses them while this
+            // runs. Accesses afterwards are to the new mapping, with zeroes, and the permissions
+            // `A` of `mapping`.
             let mapped = unsafe {
                 libc::mmap(
                     self.start as *mut libc::c_void,
                     self.len,
-                    libc::PROT_READ | libc::PROT_WRITE,
+                    prot(A::PERMISSIONS),
                     libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
                     -1,
                     0,
@@ -856,6 +787,33 @@ mod linux {
                 unregister(registration);
             }
         }
+
+        /// Whether there is a file, or a registration to make.
+        pub(in crate::codegen) fn is_on(&self) -> bool {
+            self.file.is_some() || options().gdb_jit
+        }
+
+        /// Assert that `mapping` is where the record is, with its pages being those of the record.
+        fn check<A>(&self, mapping: &Mapping<A>)
+        where
+            Mapping<A>: std::ops::Deref<Target = [u8]>,
+        {
+            assert!(
+                mapping.as_ptr() as usize == self.start
+                    && round_to_page_size(mapping.len(), PAGE_ALIGNMENT) == self.len,
+                "{} is not of this mapping",
+                self.section
+            );
+        }
+    }
+
+    /// The protection of `mmap` for `permissions`.
+    fn prot(permissions: PagePermissions) -> libc::c_int {
+        match permissions {
+            PagePermissions::Read => libc::PROT_READ,
+            PagePermissions::ReadWrite => libc::PROT_READ | libc::PROT_WRITE,
+            PagePermissions::ReadExecute => libc::PROT_READ | libc::PROT_EXEC,
+        }
     }
 
     impl Drop for CodeRecord {
@@ -865,53 +823,37 @@ mod linux {
         }
     }
 
-    /// Complete the file of the supporting code, which is final, in pages that are still read-write.
+    /// Complete writing file containing the supporting code.
     pub(in crate::codegen) fn finish_supporting_code(
         mut record: CodeRecord,
-        supports: &SupportingCode,
+        supports: &mut SupportingCode,
     ) {
-        record.finish(
-            || supporting_code_symbols(supports).1,
-            PagePermissions::ReadWrite,
-        );
+        let symbols = if record.is_on() {
+            supporting_code_symbols(supports).1
+        } else {
+            Vec::new()
+        };
+        record.finish(&mut supports.code, || symbols);
         record.keep_forever();
     }
 
-    /// Complete the file of the interpreter at `buffer`, whose steps are final and have the
-    /// lengths `step_lens`, in pages that are still read-write.
+    /// Complete writing file containing the interpreter code.
     pub(in crate::codegen) fn finish_interpreter(
         mut record: CodeRecord,
         version: SBPFVersion,
-        buffer: *const u8,
-        step_lens: &[u8],
+        interpreter: &mut Interpreter,
     ) {
-        record.finish(
-            || interpreter_symbols(version, buffer as usize, step_lens),
-            PagePermissions::ReadWrite,
-        );
+        let Interpreter { steps, step_lens } = interpreter;
+        let start = steps.as_ptr() as usize;
+        record.finish(steps, || interpreter_symbols(version, start, step_lens));
         record.keep_forever();
     }
 
-    /// Map a file for the code of the new `program` over its text pages.
-    pub(in crate::codegen) fn map_jit_text(program: &mut UnsealedJitProgram) {
+    /// Map a file over the text pages of the new `program`, for its first `len` bytes of code.
+    pub(in crate::codegen) fn map_jit_text(program: &mut UnsealedJitProgram, len: usize) {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let text = program.text_section();
-        let (start, len) = (text.as_ptr() as usize, text.len());
         let label = format!("jit-{}", COUNTER.fetch_add(1, Ordering::Relaxed));
-        // SAFETY:
-        //
-        // Contract from `CodeRecord::new`: The `len` bytes at `start` must be pages of a mapping
-        // that the caller owns.
-        //
-        // Contract from `CodeRecord::new`: Nothing may access these pages while this runs, or rely
-        // on what they held before: they are replaced with a mapping that stays until `release`.
-        //
-        // Evidence: the text section of a program that is not sealed is all of its page-rounded
-        // text capacity, which starts at a page boundary after the page-rounded pc section, within
-        // the allocation that `program` owns. Nothing was written to it yet, and the code is
-        // generated into it afterwards. The `JitProgram` releases the record when dropped, before
-        // returning the allocation to the pool.
-        let record = unsafe { CodeRecord::new(&label, start, len) };
+        let record = CodeRecord::new(&label, program.text_mapping_mut(), len);
         program.code_record = Some(record);
     }
 
@@ -925,17 +867,17 @@ mod linux {
             .code_record
             .take()
             .expect("the program has its file from `map_jit_text`");
-        record.finish(
-            || {
-                jit_symbols(
-                    templates,
-                    executable,
-                    program,
-                    options().instruction_symbols,
-                )
-            },
-            PagePermissions::ReadExecute,
-        );
+        let symbols = if record.is_on() {
+            jit_symbols(
+                templates,
+                executable,
+                program,
+                options().instruction_symbols,
+            )
+        } else {
+            Vec::new()
+        };
+        record.finish(program.text_mapping_mut(), || symbols);
         program.code_record = Some(record);
     }
 
@@ -1337,61 +1279,24 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn code_record_file() {
-        use crate::memory_management::{allocate_pages_low, PagePermissions};
+        use crate::memory_management::{Mapping, ReadExecute};
         let directory =
             std::env::temp_dir().join(format!("sbpf-code-record-{}", std::process::id()));
         let label = "code-record-test";
-        // Leaked, as the pages are only freed by the owners of the code that this is the record of.
-        let start = allocate_pages_low(PAGE_ALIGNMENT).unwrap() as usize;
-        // SAFETY:
-        //
-        // Contract from `CodeRecord::new_in`: The `len` bytes at `start` must be pages of a
-        // mapping that the caller owns.
-        //
-        // Contract from `CodeRecord::new_in`: Nothing may access these pages while this runs, or
-        // rely on what they held before: they are replaced with a mapping that stays until
-        // `release`.
-        //
-        // Evidence: the page was just allocated by `allocate_pages_low` for this test, which
-        // nothing else knows of, and it is only accessed afterwards.
-        let mut record =
-            unsafe { CodeRecord::new_in(Some(&directory), label, start, PAGE_ALIGNMENT) };
+        let mut mapping = Mapping::low(PAGE_ALIGNMENT).unwrap();
+        let start = mapping.as_ptr() as usize;
+        let mut record = CodeRecord::new_in(Some(&directory), label, &mut mapping, PAGE_ALIGNMENT);
         let code = [0x90, 0xc3];
-        // SAFETY:
-        //
-        // Contract from `ptr::copy_nonoverlapping`: `src` must be valid for reads of `count *
-        // size_of::<T>()` bytes or that number must be 0.
-        //
-        // Contract from `ptr::copy_nonoverlapping`: `dst` must be valid for writes of `count *
-        // size_of::<T>()` bytes or that number must be 0.
-        //
-        // Contract from `ptr::copy_nonoverlapping`: Both `src` and `dst` must be properly aligned.
-        //
-        // Contract from `ptr::copy_nonoverlapping`: The region of memory beginning at `src` with a
-        // size of `count * size_of::<T>()` bytes must *not* overlap with the region of memory
-        // beginning at `dst` with the same size.
-        //
-        // Evidence: `T` is `u8`, so the pointers are aligned, and the size is 2 bytes. `code` is
-        // an array, so valid for reads, and the destination is the start of the read-write
-        // mapping of the file that `new_in` made, which does not overlap it.
-        unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), start as *mut u8, code.len()) };
+        mapping[..code.len()].copy_from_slice(&code);
+        let mut mapping = mapping.protect::<ReadExecute>().unwrap();
         let symbol = Symbol {
             name: "f".to_string(),
             address: start,
             size: code.len(),
         };
         let symbols = vec![symbol.clone()];
-        record.finish(|| symbols, PagePermissions::ReadExecute);
-        // SAFETY:
-        //
-        // Contract from `read_memory`: `start` must be non-null, and the `len` bytes at it must be
-        // readable and initialized, within a single allocation.
-        //
-        // Contract from `read_memory`: Nothing may write to these bytes while this runs.
-        //
-        // Evidence: `finish` mapped the page read-execute with the content of the file, and
-        // nothing else knows of it.
-        let mapped = unsafe { read_memory(start, PAGE_ALIGNMENT) };
+        record.finish(&mut mapping, || symbols);
+        let mapped = mapping.to_vec();
         let mut expected = vec![0; PAGE_ALIGNMENT];
         expected[..code.len()].copy_from_slice(&code);
         assert_eq!(mapped, expected);
@@ -1404,16 +1309,9 @@ mod tests {
             symbols: vec![symbol],
         };
         check_elf_image(&image, &[region]);
-        // SAFETY:
-        //
-        // Contract from `CodeRecord::release`: The `len` bytes at `start` given to `new` must
-        // still be pages that the caller owns.
-        //
-        // Contract from `CodeRecord::release`: Nothing may access these pages while this runs, or
-        // rely on what they held before: they are replaced with an anonymous mapping.
-        //
-        // Evidence: the page is still this test's, and it is not accessed afterwards.
-        unsafe { record.release() };
+        record.release(&mut mapping);
+        assert!(mapping.iter().all(|&byte| byte == 0));
+        drop(mapping);
         assert_eq!(std::fs::read(&path).unwrap(), image);
         std::fs::remove_dir_all(&directory).unwrap();
     }

@@ -301,6 +301,12 @@ impl UnsealedJitProgram {
         &mut self.text_section
     }
 
+    /// The mapping of the text section, for `codegen::debug` to map a file over.
+    #[cfg(all(feature = "codegen-debug", target_arch = "x86_64", target_os = "linux"))]
+    pub(crate) fn text_mapping_mut(&mut self) -> &mut Mapping {
+        &mut self.text_section
+    }
+
     /// Make the pc section read-only and the text section, shrunk to the `used` length,
     /// executable.
     pub fn seal(self, used: usize) -> Result<JitProgram, EbpfError> {
@@ -351,6 +357,12 @@ pub struct JitProgram {
 }
 
 impl JitProgram {
+    /// The mapping of the text section, for `codegen::debug` to complete the file of.
+    #[cfg(all(feature = "codegen-debug", target_arch = "x86_64", target_os = "linux"))]
+    pub(crate) fn text_mapping_mut(&mut self) -> &mut Mapping<ReadExecute> {
+        &mut self.text_section
+    }
+
     /// Offset in `text_section` for each BPF instruction.
     #[inline]
     pub fn pc_section(&self) -> &[u32] {
@@ -384,14 +396,7 @@ impl Drop for JitProgram {
     fn drop(&mut self) {
         #[cfg(all(feature = "codegen-debug", target_arch = "x86_64", target_os = "linux"))]
         if let Some(code_record) = self.code_record.take() {
-            // SAFETY:
-            //
-            // Contract from `CodeRecord::release`: the range must still be owned by the caller,
-            // and not accessed while this runs or relied on afterwards.
-            // Evidence: the record is of `text_section`, which is only returned to the pool after
-            // this, when the sections are dropped. Dropping `self` means that nothing
-            // executes or reads the code, and the pool treats the memory as arbitrary bytes.
-            unsafe { code_record.release() };
+            code_record.release(&mut self.text_section);
         }
     }
 }
