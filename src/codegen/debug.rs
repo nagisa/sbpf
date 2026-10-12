@@ -1029,6 +1029,24 @@ mod linux {
         _symfile: Box<[u8]>,
     }
 
+    // SAFETY:
+    //
+    // Contract from `Send`: Types that can be transferred across thread boundaries.
+    //
+    // Evidence: `entry` is only accessed by `register` and `unregister`, while holding `LIST_LOCK`,
+    // so from any thread.
+    unsafe impl Send for Registration {}
+    // SAFETY:
+    //
+    // Contract from `Sync`: Types for which it is safe to share references between threads.
+    //
+    // Contract from `Sync`: The precise definition is: a type `T` is `Sync` if and only if `&T` is
+    // `Send`. In other words, if there is no possibility of undefined behavior (including data
+    // races) when passing `&T` references between threads.
+    //
+    // Evidence: `&Registration` does not access `entry`.
+    unsafe impl Sync for Registration {}
+
     /// Add the ELF file `symfile` to the list of the debugger.
     fn register(symfile: Box<[u8]>) -> Registration {
         let entry = Box::into_raw(Box::new(JitCodeEntry {
