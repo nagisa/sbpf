@@ -24,7 +24,7 @@
 //!   symbol for each BPF instruction, rather than only for the functions of the executable, which
 //!   is expensive for large programs.
 
-use super::arch::SupportingCode;
+use super::arch::{IslandEntry, SupportingCode};
 use super::generate::{self, Interpreter, InterpreterGenerator, TemplateOpcode};
 use super::templates::{AuxTemplate, JitTemplates};
 use crate::disassembler::disassemble_instruction;
@@ -146,9 +146,17 @@ pub struct Template {
     pub relocations: Vec<RelocationInfo>,
 }
 
-/// The code shared by the JIT output and the interpreters.
+/// The code shared by the JIT output and the interpreters, as if it was at address 0: it is
+/// position independent, and copied into either.
 pub fn supporting_code() -> Region {
-    supporting_code_region(SupportingCode::get())
+    let supports = SupportingCode::get();
+    Region {
+        name: ".text.supports".to_string(),
+        executable: true,
+        start: 0,
+        bytes: supports.code.to_vec(),
+        symbols: supporting_code_symbols(supports, 0),
+    }
 }
 
 /// The interpreter for `version`, with a symbol for each of its steps.
@@ -229,18 +237,6 @@ fn sized_symbols(mut named: Vec<(String, usize)>, end: usize) -> Vec<Symbol> {
     symbols
 }
 
-fn supporting_code_region(supports: &SupportingCode) -> Region {
-    let (range, symbols) = supporting_code_symbols(supports);
-    let bytes = supports.code[..range.len()].to_vec();
-    Region {
-        name: ".text.supports".to_string(),
-        executable: true,
-        start: range.start,
-        bytes,
-        symbols,
-    }
-}
-
 fn interpreter_region(version: SBPFVersion, interpreter: &Interpreter) -> Region {
     let start = interpreter.steps.as_ptr() as usize;
     Region {
@@ -248,7 +244,12 @@ fn interpreter_region(version: SBPFVersion, interpreter: &Interpreter) -> Region
         executable: true,
         start,
         bytes: interpreter.steps.to_vec(),
-        symbols: interpreter_symbols(version, start, &interpreter.step_lens),
+        symbols: {
+            let mut symbols = interpreter_symbols(version, start, &interpreter.step_lens);
+            let supports = interpreter.supports() as usize;
+            symbols.extend(supporting_code_symbols(SupportingCode::get(), supports));
+            symbols
+        },
     }
 }
 
@@ -283,11 +284,10 @@ fn jit_regions<const SIZE: usize, C: ContextObject>(
     ]
 }
 
-/// The address range of the supporting code, and its symbols.
-fn supporting_code_symbols(supports: &SupportingCode) -> (std::ops::Range<usize>, Vec<Symbol>) {
-    let (range, named) = supports.debug_symbols();
-    let symbols = sized_symbols(named, range.end as usize);
-    (range.start as usize..range.end as usize, symbols)
+/// The symbols of a copy of the supporting code at `start`.
+fn supporting_code_symbols(supports: &SupportingCode, start: usize) -> Vec<Symbol> {
+    let end = start.checked_add(supports.code.len()).unwrap();
+    sized_symbols(supports.debug_symbols(start), end)
 }
 
 fn version_name(version: SBPFVersion) -> String {
@@ -356,16 +356,28 @@ fn jit_symbols<const SIZE: usize, C: ContextObject>(
     let text = program.text_section();
     let start = text.as_ptr() as usize;
 
-    let names = [
-        "invalid_call_target",
-        "sig_invalid_insn",
-        "sig_meter_exceeded",
+    // The first island and copy of the supporting code. Programs are not large enough to have more.
+    let island = start
+        .checked_add(templates.aux_layout(AuxTemplate::InvalidCallTarget).len())
+        .unwrap();
+    let mut named = vec![
+        ("invalid_call_target".to_string(), start),
+        (
+            "sig_invalid_insn".to_string(),
+            island
+                .checked_add(templates.island_entries[IslandEntry::SigInvalidInsn as usize])
+                .unwrap(),
+        ),
+        (
+            "sig_meter_exceeded".to_string(),
+            island
+                .checked_add(templates.island_entries[IslandEntry::SigMeterExceeded as usize])
+                .unwrap(),
+        ),
     ];
-    let mut named: Vec<_> = names
-        .iter()
-        .zip(templates.shared_offsets())
-        .map(|(name, offset)| (name.to_string(), start.checked_add(offset).unwrap()))
-        .collect();
+    let supports = SupportingCode::get();
+    let first_supports = start.checked_add(templates.first_supports()).unwrap();
+    named.extend(supports.debug_symbols(first_supports));
     let pc_section = program.pc_section();
     if instruction_symbols {
         let version = executable.get_sbpf_version();
@@ -415,10 +427,13 @@ fn jit_symbols<const SIZE: usize, C: ContextObject>(
     named.push(("execution_overrun".to_string(), overrun));
 
     let mut symbols = sized_symbols(named, start.checked_add(text.len()).unwrap());
-    // The padding that may follow the shared templates is not part of the last of them.
-    let last = AuxTemplate::SHARED.len().checked_sub(1).unwrap();
-    let last_len = templates.aux_layout(AuxTemplate::SHARED[last]).len();
-    symbols[last].size = symbols[last].size.min(last_len);
+    // The padding that may follow the supporting code is not part of its last routine.
+    let supports_end = first_supports.checked_add(supports.code.len()).unwrap();
+    for symbol in &mut symbols {
+        if symbol.address < supports_end {
+            symbol.size = symbol.size.min(supports_end.wrapping_sub(symbol.address));
+        }
+    }
     symbols
 }
 
@@ -750,12 +765,6 @@ fn write_all_at(file: &File, bytes: &[u8]) -> io::Result<()> {
     }
 }
 
-/// Complete the `image` of the supporting code, which is final, and keep it registered for as long
-/// as the process lives, as the code is.
-pub(in crate::codegen) fn finish_supporting_code(image: DebugImage, supports: &SupportingCode) {
-    std::mem::forget(image.finish(|| vec![supporting_code_region(supports)]));
-}
-
 /// Complete the `image` of the interpreter for `version`, whose steps are final, and keep it
 /// registered for as long as the process lives, as the interpreter is.
 pub(in crate::codegen) fn finish_interpreter(
@@ -993,6 +1002,7 @@ impl Drop for Registration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codegen::arch::SupportEntry;
     use object::read::elf::{ElfFile64, ProgramHeader as _};
     use object::{Object as _, ObjectSection as _, ObjectSymbol as _};
 
@@ -1051,10 +1061,7 @@ mod tests {
         let region = supporting_code();
         let end = region.start + region.bytes.len();
         assert!(region.symbols.iter().any(|s| s.name == "entry_point"));
-        assert!(region
-            .symbols
-            .iter()
-            .any(|s| s.name == "divide_div64_r1_r2"));
+        assert!(region.symbols.iter().any(|s| s.name == "div64"));
         assert!(region
             .symbols
             .windows(2)
@@ -1071,7 +1078,12 @@ mod tests {
     fn interpreter_symbols_cover_all_steps() {
         const STEP_SIZE: usize = 1 << InterpreterGenerator::STEP_SIZE_LOG2;
         let region = interpreter(SBPFVersion::V3);
-        assert_eq!(region.symbols.len(), TemplateOpcode::COUNT);
+        // The steps are followed by the supporting code.
+        assert_eq!(
+            region.symbols.len(),
+            TemplateOpcode::COUNT + SupportEntry::COUNT
+        );
+        assert!(region.symbols.iter().any(|s| s.name == "entry_point"));
         assert!(region
             .symbols
             .iter()
@@ -1080,7 +1092,7 @@ mod tests {
             .symbols
             .iter()
             .any(|s| s.name == "step_00_op00_dst0_src0"));
-        for (index, symbol) in region.symbols.iter().enumerate() {
+        for (index, symbol) in region.symbols[..TemplateOpcode::COUNT].iter().enumerate() {
             let offset = symbol.address - region.start;
             assert_eq!(offset, index * STEP_SIZE);
             assert!(symbol.size > 0 && symbol.size <= STEP_SIZE);
@@ -1188,7 +1200,10 @@ mod tests {
                 "sig_meter_exceeded",
             ];
             assert_eq!(names[..3], shared);
-            assert_eq!(names[3..names.len() - 1], *expected);
+            // The supporting code follows the island.
+            let supports = 3 + SupportEntry::COUNT;
+            assert!(names[3..supports].contains(&"entry_point"));
+            assert_eq!(names[supports..names.len() - 1], *expected);
             assert_eq!(names.last(), Some(&"execution_overrun"));
             let end = region.start + region.bytes.len();
             assert!(region
