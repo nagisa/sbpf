@@ -37,8 +37,6 @@ const R14: u8 = 14;
 const R15: u8 = 15;
 
 // Internal registers. Keep in sync with the `.alias`es in `x64asm!`.
-const RINSN: u8 = RAX;
-
 const RTEMP: u8 = RCX;
 
 const RMETER: u8 = RDX;
@@ -154,8 +152,8 @@ pub(super) mod supporting_code;
 pub(super) use entry::enter;
 use entry::Frame;
 pub(super) use insn::{
-    aux_template, bpf_insn, interpreter_dispatch, interpreter_taken_branch, island,
-    jit_taken_branch,
+    aux_template, bpf_insn, interpreter_dispatch, interpreter_jump, interpreter_taken_branch,
+    island, jit_taken_branch,
 };
 pub(super) use relocation::{
     TemplateRelocation, TemplateRelocationKind, MAX_JIT_TEMPLATE_SIZE, MAX_RELOCATIONS,
@@ -176,22 +174,30 @@ pub(super) const SUPPORTS_ALIGNMENT: usize = 16;
 ///
 /// The templates refer to the entries of the latest island by the global labels of
 /// [`Self::of_global`].
+// Named after the global labels.
+#[allow(clippy::enum_variant_names)]
 #[derive(Clone, Copy, Debug)]
 pub(super) enum IslandEntry {
     /// Terminate for an invalid instruction.
     SigInvalidInsn,
     /// Terminate as the instruction meter is exceeded.
     SigMeterExceeded,
+    /// Terminate as the instruction meter is exceeded if `RINSN` is at or past `RMETER`, and
+    /// otherwise as the execution ran past the end of the text section, for the interpreter, which
+    /// has no code after the last instruction to catch it. `RINSN` points at where the next
+    /// instruction would be.
+    SigExceededOrOverrun,
 }
 
 impl IslandEntry {
-    pub(super) const COUNT: usize = 2;
+    pub(super) const COUNT: usize = 3;
 
     /// The entry that the global label `name` refers to.
     pub(super) fn of_global(name: &str) -> Option<Self> {
         match name {
             "sig_invalid_insn" => Some(Self::SigInvalidInsn),
             "sig_meter_exceeded" => Some(Self::SigMeterExceeded),
+            "sig_exceeded_or_overrun" => Some(Self::SigExceededOrOverrun),
             _ => None,
         }
     }
@@ -200,8 +206,8 @@ impl IslandEntry {
 /// The offsets of the entries from the start of an island.
 pub(super) type IslandEntries = [usize; IslandEntry::COUNT];
 
-/// The interpreter steps are 128 bytes.
-pub(super) const INTERPRETER_STEP_SIZE_LOG2: u8 = 7;
+/// The interpreter steps are 64 bytes, a cache line, or 128 with the calls of the tracer.
+pub(super) const INTERPRETER_STEP_SIZE_LOG2: u8 = if cfg!(feature = "tracer") { 7 } else { 6 };
 
 /// `int3`, to fill the unused space of the interpreter steps.
 pub(super) const TRAP_FILL: u8 = 0xcc;

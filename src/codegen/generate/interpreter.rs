@@ -1,7 +1,8 @@
 //! Generation of the interpreter.
 
-use super::{Generator, LabelRelocs, PatchFields, TemplateOpcode};
+use super::{Generator, LabelRelocs, PatchFields, Reg, TemplateOpcode};
 use crate::codegen::arch::{self, SupportEntry, SupportingCode, TemplateRelocationKind};
+use crate::ebpf;
 use crate::memory_management::{Mapping, ReadExecute, HUGE_PAGE_SIZE};
 use crate::program::SBPFVersion;
 use dynasmrt::relocations::{Relocation, RelocationKind};
@@ -39,6 +40,11 @@ impl Interpreter {
 /// This interpreter uses a dispatch table with one step of `1 << STEP_SIZE_LOG2` bytes per
 /// `TemplateOpcode`, each running its instruction and then dispatching the execution to the next
 /// one directly.
+///
+/// A step that does not fit its slot together with the dispatch jumps to a copy of the dispatch in
+/// a slot of its own, [`Self::dispatch_slot`], one that no valid instruction uses. Each such step
+/// has its own copy, so that the indirect jumps of the dispatch remain as many as the steps for the
+/// branch predictor.
 pub(in crate::codegen) struct InterpreterGenerator {
     buffer: Mapping,
     relocs: LabelRelocs<arch::Relocation>,
@@ -62,8 +68,50 @@ impl InterpreterGenerator {
     const SUPPORTS: usize = Self::STEP_TABLE_SIZE;
 
     /// Offset into the `buffer` for this opcode.
-    fn step_offset(opcode: TemplateOpcode) -> usize {
+    pub(in crate::codegen) fn step_offset(opcode: TemplateOpcode) -> usize {
         opcode.index() << Self::STEP_SIZE_LOG2
+    }
+
+    /// The slot of the dispatch of the step for `opcode`, for when the step does not fit its own
+    /// slot together with the dispatch.
+    ///
+    /// The slot has a register field that no valid instruction has: these are more than those of
+    /// the valid instructions, which are mapped to them in order. Its operation differs in the
+    /// lowest bit, which puts it into the cache set next to that of the step, rather than the same
+    /// one, as long as the slots are laid out in the order of the opcodes. Operation 0 is not a valid
+    /// instruction, and its slots hold the islands instead, so operation 1 (not a valid instruction
+    /// either) keeps its own.
+    fn dispatch_slot(opcode: TemplateOpcode) -> Option<TemplateOpcode> {
+        let (Some(dst), Some(src)) = (opcode.dst(), opcode.src()) else {
+            return None;
+        };
+        let op = match opcode.op() {
+            0 => return None,
+            1 => 1,
+            op => op ^ 1,
+        };
+        let registers = usize::from(dst.0)
+            .checked_mul(Reg::COUNT)?
+            .checked_add(usize::from(src.0))?;
+        let field = u16::from(INVALID_REGISTER_FIELDS[registers]);
+        Some(TemplateOpcode(u16::from(op) | field << 8))
+    }
+
+    /// The step whose dispatch is in the slot of `opcode`, see [`Self::dispatch_slot`].
+    pub(in crate::codegen) fn dispatched_step(opcode: TemplateOpcode) -> Option<TemplateOpcode> {
+        let op = match opcode.op() {
+            0 => return None,
+            1 => 1,
+            op => op ^ 1,
+        };
+        let field = (opcode.0 >> 8) as u8;
+        let registers = INVALID_REGISTER_FIELDS[..Reg::COUNT * Reg::COUNT]
+            .iter()
+            .position(|&invalid| invalid == field)?;
+        let (dst, src) = (registers / Reg::COUNT, registers % Reg::COUNT);
+        Some(TemplateOpcode(
+            u16::from(op) | (dst as u16) << 8 | (src as u16) << 12,
+        ))
     }
 
     pub(in crate::codegen) fn base(&self) -> *const u8 {
@@ -90,8 +138,36 @@ impl InterpreterGenerator {
 }
 
 impl InterpreterGenerator {
+    /// Complete the code of the `slot` that ends at the current offset, returning its length.
+    fn finish_slot(&mut self, slot: TemplateOpcode) -> usize {
+        let start = Self::step_offset(slot);
+        let len = self.offset.checked_sub(start).unwrap();
+        assert!(
+            len <= 1 << Self::STEP_SIZE_LOG2,
+            "step for {:#x} is too long",
+            slot.0
+        );
+        let code = &mut self.buffer[start..self.offset];
+        self.relocs.resolve(code, start);
+        len
+    }
+
+    /// Resolve the relocation that `dynasm` reports at the current offset for an `extern` jump
+    /// target, which in the interpreter is the offset of the `target` rather than its address.
+    pub(in crate::codegen) fn value_reloc(
+        &mut self,
+        target: usize,
+        field_offset: u8,
+        ref_offset: u8,
+        kind: u8,
+    ) {
+        // `dynasm` reports a relocation relative to an absolute address, while the offset is
+        // reached like a label: clear the kind to `RelocationKind::Relative`.
+        self.relative_reloc(target, 0, field_offset, ref_offset, kind & 0x3f);
+    }
+
     /// Resolve a relative relocation reported at the current offset to the `target` offset.
-    fn relative_reloc(
+    pub(in crate::codegen) fn relative_reloc(
         &mut self,
         target: usize,
         target_offset: isize,
@@ -210,6 +286,20 @@ static INTERPRETERS: [LazyLock<Interpreter>; 5] = [
     LazyLock::new(|| generate_interpreter(SBPFVersion::V4)),
 ];
 
+/// The register fields of the opcodes, `dst | src << 4`, that no valid instruction has, in order.
+const INVALID_REGISTER_FIELDS: [u8; 256 - Reg::COUNT * Reg::COUNT] = {
+    let mut fields = [0; 256 - Reg::COUNT * Reg::COUNT];
+    let (mut field, mut count) = (0, 0);
+    while field < 256 {
+        if field & 0xf >= Reg::COUNT || field >> 4 >= Reg::COUNT {
+            fields[count] = field as u8;
+            count += 1;
+        }
+        field += 1;
+    }
+    fields
+};
+
 /// The interpreter for the SBPF `version`.
 pub(in crate::codegen) fn interpreter(version: SBPFVersion) -> &'static Interpreter {
     &INTERPRETERS[version as usize]
@@ -233,31 +323,73 @@ fn generate_interpreter(version: SBPFVersion) -> Interpreter {
     let mut generator = InterpreterGenerator::new(version, buffer);
     #[cfg(feature = "codegen-debug")]
     let mut step_lens = vec![0; TemplateOpcode::COUNT];
-    for opcode in TemplateOpcode::all() {
-        let step_start = InterpreterGenerator::step_offset(opcode);
-        generator.opcode = opcode;
-        generator.offset = step_start;
+    // The islands, and the copies of the dispatch, which tell how long the dispatch is for the
+    // instructions of each size.
+    let mut islands = Vec::with_capacity(TemplateOpcode::COUNT >> 8);
+    let mut dispatch_lens = [0; 3];
+    for slot in TemplateOpcode::all() {
+        generator.offset = InterpreterGenerator::step_offset(slot);
         generator.terminal = false;
-        if opcode.op() == 0 {
+        if slot.op() == 0 {
+            // Not a valid instruction, so it only terminates the execution and needs no dispatch.
+            generator.opcode = slot;
             let start = generator.offset;
-            generator.island =
-                Some(arch::island(&mut generator).map(|entry| start.wrapping_add(entry)));
+            let island = arch::island(&mut generator).map(|entry| start.wrapping_add(entry));
+            generator.island = Some(island);
+            islands.push(island);
+            arch::bpf_insn(&mut generator);
+        } else if let Some(step) = InterpreterGenerator::dispatched_step(slot) {
+            generator.opcode = step;
+            let start = generator.offset;
+            arch::interpreter_dispatch(&mut generator);
+            let size = ebpf::opcode_size(step.op(), version) / ebpf::INSN_SIZE;
+            dispatch_lens[size] = generator.offset.checked_sub(start).unwrap();
+        } else {
+            continue;
         }
-        arch::bpf_insn(&mut generator);
-        generator.terminal = false;
-        arch::interpreter_dispatch(&mut generator);
-        let step_len = generator.offset.checked_sub(step_start).unwrap();
-        assert!(
-            step_len <= 1 << InterpreterGenerator::STEP_SIZE_LOG2,
-            "step for {:#x} is too long",
-            opcode.0
-        );
-        let step = &mut generator.buffer[step_start..generator.offset];
-        generator.relocs.resolve(step, step_start);
+        let len = generator.finish_slot(slot);
         #[cfg(feature = "codegen-debug")]
         {
-            step_lens[opcode.index()] = step_len.try_into().unwrap();
+            step_lens[slot.index()] = len.try_into().unwrap();
         }
+        #[cfg(not(feature = "codegen-debug"))]
+        let _ = len;
+    }
+
+    for opcode in TemplateOpcode::all() {
+        if opcode.op() == 0 || InterpreterGenerator::dispatched_step(opcode).is_some() {
+            continue;
+        }
+        let start = InterpreterGenerator::step_offset(opcode);
+        generator.opcode = opcode;
+        generator.offset = start;
+        generator.terminal = false;
+        generator.island = Some(islands[opcode.index() >> 8]);
+        arch::bpf_insn(&mut generator);
+        generator.terminal = false;
+        let size = ebpf::opcode_size(opcode.op(), version) / ebpf::INSN_SIZE;
+        let fits = generator
+            .offset
+            .checked_sub(start)
+            .unwrap()
+            .checked_add(dispatch_lens[size])
+            .unwrap()
+            <= 1 << InterpreterGenerator::STEP_SIZE_LOG2;
+        if opcode.dst().is_none() || opcode.src().is_none() {
+            // Not a valid instruction, so it only terminates the execution and needs no dispatch.
+        } else if fits {
+            arch::interpreter_dispatch(&mut generator);
+        } else {
+            let slot = InterpreterGenerator::dispatch_slot(opcode).unwrap();
+            arch::interpreter_jump(&mut generator, InterpreterGenerator::step_offset(slot));
+        }
+        let len = generator.finish_slot(opcode);
+        #[cfg(feature = "codegen-debug")]
+        {
+            step_lens[opcode.index()] = len.try_into().unwrap();
+        }
+        #[cfg(not(feature = "codegen-debug"))]
+        let _ = len;
     }
 
     let interpreter = Interpreter {

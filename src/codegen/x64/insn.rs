@@ -659,12 +659,35 @@ pub(in crate::codegen) fn island<G: Generator + ?Sized>(out: &mut G) -> IslandEn
     let start = out.offset();
     let end = out.new_dynamic_label();
     x64asm!(out; jmp BYTE =>end);
+    let exceeded = out.new_dynamic_label();
+    let overrun = out.new_dynamic_label();
+    // As `terminate_invalid_insn_with_meter_check`, with `SigExceededOrOverrun` before the
+    // termination for the meter, which they share.
     let sig_invalid_insn = out.offset();
-    let sig_meter_exceeded = terminate_invalid_insn_with_meter_check(out);
+    x64asm!(out
+        ; cmp RTEMP, RMETER
+        ; ja BYTE =>exceeded
+        ;; terminate(out, SIG_INVALID_INSN)
+    );
+    let sig_exceeded_or_overrun = out.offset();
+    x64asm!(out
+        ; cmp RINSN, RMETER
+        ; jb BYTE =>overrun
+        ; =>exceeded
+    );
+    let sig_meter_exceeded = out.offset();
+    terminate(out, SIG_EXCEEDED_MAX_INSTRUCTIONS);
+    x64asm!(out
+        ; =>overrun
+        ; lea RTEMP, [BYTE ebpf::INSN_SIZE as i8 + RINSN]
+        ;; terminate(out, SIG_EXECUTION_OVERRUN)
+    );
     out.dynamic_label(end);
     let mut entries = [0; IslandEntry::COUNT];
     entries[IslandEntry::SigInvalidInsn as usize] = sig_invalid_insn.wrapping_sub(start);
     entries[IslandEntry::SigMeterExceeded as usize] = sig_meter_exceeded.wrapping_sub(start);
+    entries[IslandEntry::SigExceededOrOverrun as usize] =
+        sig_exceeded_or_overrun.wrapping_sub(start);
     entries
 }
 
@@ -703,33 +726,36 @@ fn adjust_meter_for_taken_branch<G: Generator + ?Sized>(out: &mut G, next_insn_i
 /// Dispatches to the step of the next instruction.
 pub(in crate::codegen) fn interpreter_dispatch(out: &mut InterpreterGenerator) {
     let base_addr = i32::try_from(out.base() as usize).expect("interpreter in first 2GB");
-    // `insn` points at the last 8 bytes of the instruction just executed.
+    // `RINSN` points at the last 8 bytes of the instruction just executed, past the first 8. Once
+    // past the rest, it points at the next instruction for any size of this one.
     let size = i8::try_from(ebpf::opcode_size(out.opcode().op(), out.version())).unwrap();
-    let to_last = size.checked_sub(8).unwrap();
-    let next_insn = if size == 8 {
-        RINSN
-    } else {
-        x64asm!(out; lea RTEMP, [ BYTE to_last + RINSN ]);
-        RTEMP
-    };
+    let rest = size.checked_sub(ebpf::INSN_SIZE as i8).unwrap();
+    if rest != 0 {
+        x64asm!(out; add RINSN, BYTE rest);
+    }
     // Unlike the JIT, the interpreter checks the meter after every instruction. This has little
     // impact on the throughput. Overrun has to be checked here as there is no code after the last
-    // instruction to catch it.
-    let overrun = out.new_dynamic_label();
+    // instruction to catch it. Both checks branch to a jump to the island after the dispatch, which
+    // is shorter than two branches to the island.
+    let exit = out.new_dynamic_label();
     x64asm!(out
-        ; cmp Rq(next_insn), RMETER
-        ; jae ->sig_meter_exceeded
-        ; cmp Rq(next_insn), [BYTE frame!(text_section_limit) + rbp]
-        ; jae BYTE =>overrun
-        ; movzx RTEMP, WORD [ BYTE to_last + RINSN ]
-        ; shl RTEMP, InterpreterGenerator::STEP_SIZE_LOG2 as i8
+        ; cmp RINSN, RMETER
+        ; jae BYTE =>exit
+        ; cmp RINSN, [BYTE frame!(text_section_limit) + rbp]
+        ; jae BYTE =>exit
+        ; movzx WTEMP, WORD [RINSN]
+        ; shl WTEMP, InterpreterGenerator::STEP_SIZE_LOG2 as i8
         ; lea RTEMP, [ DWORD base_addr + RTEMP ]
-        ; add RINSN, BYTE size
+        ; add RINSN, BYTE ebpf::INSN_SIZE as i8
         ; jmp RTEMP
-        ; =>overrun
-        ; lea RTEMP, [ BYTE size + RINSN ]
-        ;; terminate(out, SIG_EXECUTION_OVERRUN)
+        ; =>exit
+        ; jmp ->sig_exceeded_or_overrun
     );
+}
+
+/// Jump to the code at the offset `target` in the interpreter.
+pub(in crate::codegen) fn interpreter_jump(out: &mut InterpreterGenerator, target: usize) {
+    x64asm!(out; jmp extern target);
 }
 
 /// Load the address of the BPF instruction following the current one into `RTEMP`.

@@ -316,10 +316,16 @@ fn mnemonic(
 
 /// The symbols of the steps of the interpreter at `start`, one for each of the opcodes, as long as
 /// the code of the step: the rest of its slot is padding. `step_lens` is indexed like the steps.
+///
+/// The slots that hold the dispatch of another step are named after that step, `dispatch_...`.
 fn interpreter_symbols(version: SBPFVersion, start: usize, step_lens: &[u8]) -> Vec<Symbol> {
     let loader = BuiltinProgram::<DummyContextObject>::new_mock();
     let mut symbols = Vec::with_capacity(TemplateOpcode::COUNT);
-    for opcode in 0..=u16::MAX {
+    for slot in 0..=u16::MAX {
+        let (kind, opcode) = match InterpreterGenerator::dispatched_step(TemplateOpcode(slot)) {
+            Some(step) => ("dispatch", step.0),
+            None => ("step", slot),
+        };
         let (op, dst, src) = (opcode as u8, (opcode >> 8) & 0xf, opcode >> 12);
         let insn = ebpf::Insn {
             ptr: 0,
@@ -330,14 +336,14 @@ fn interpreter_symbols(version: SBPFVersion, start: usize, step_lens: &[u8]) -> 
             // Valid for `be` and `le`, which the disassembler complains about otherwise.
             imm: 16,
         };
-        let index = TemplateOpcode(opcode).index();
+        let index = TemplateOpcode(slot).index();
         symbols.push(Symbol {
             name: format!(
-                "step_{op:02x}_{}_dst{dst}_src{src}",
+                "{kind}_{op:02x}_{}_dst{dst}_src{src}",
                 mnemonic(&loader, version, &insn)
             ),
             address: start
-                .checked_add(index << InterpreterGenerator::STEP_SIZE_LOG2)
+                .checked_add(InterpreterGenerator::step_offset(TemplateOpcode(slot)))
                 .unwrap(),
             size: usize::from(step_lens[index]),
         });
@@ -1094,7 +1100,8 @@ mod tests {
             .any(|s| s.name == "step_00_op00_dst0_src0"));
         for (index, symbol) in region.symbols[..TemplateOpcode::COUNT].iter().enumerate() {
             let offset = symbol.address - region.start;
-            assert_eq!(offset, index * STEP_SIZE);
+            let opcode = TemplateOpcode(u16::try_from(index).unwrap());
+            assert_eq!(offset, InterpreterGenerator::step_offset(opcode));
             assert!(symbol.size > 0 && symbol.size <= STEP_SIZE);
             // The padding traps.
             let padding = &region.bytes[offset + symbol.size..offset + STEP_SIZE];
