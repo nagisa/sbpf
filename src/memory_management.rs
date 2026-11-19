@@ -212,22 +212,30 @@ impl Pages {
     /// `map` is given the address hint, and returns the pages that it mapped, or `None` if the
     /// system refused to map them there.
     ///
+    /// Mappings of at least [`HUGE_PAGE_SIZE`] start at a multiple of it, so that they can be
+    /// backed by huge pages, see [`Mapping::collapse_huge_pages`].
+    ///
     /// # Panics
     ///
     /// Panics if no such pages could be mapped.
     fn map_sub2g_with(len: usize, map: impl Fn(*mut c_void) -> Option<Self>) -> Self {
-        const ALIGNMENT: usize = 64 * 1024;
         const LOWEST: usize = 256 * 1024 * 1024;
         const HIGHEST: usize = 2 * 1024 * 1024 * 1024;
         const ATTEMPTS: usize = 64;
 
+        let alignment = if len >= HUGE_PAGE_SIZE {
+            HUGE_PAGE_SIZE
+        } else {
+            64 * 1024
+        };
         let slots = HIGHEST
             .saturating_sub(LOWEST)
             .checked_sub(len)
-            .map(|spare| spare.saturating_div(ALIGNMENT).saturating_add(1));
+            .and_then(|spare| spare.checked_div(alignment))
+            .map(|slots| slots.saturating_add(1));
         for _ in 0..slots.map_or(0, |_| ATTEMPTS) {
             let slot = thread_rng().gen_range(0..slots.unwrap_or(1));
-            let hint = LOWEST.saturating_add(slot.saturating_mul(ALIGNMENT)) as *mut c_void;
+            let hint = LOWEST.saturating_add(slot.saturating_mul(alignment)) as *mut c_void;
             let Some(pages) = map(hint) else {
                 continue;
             };
@@ -505,6 +513,36 @@ impl<A> Mapping<A> {
     pub(crate) fn mapped_len(&self) -> usize {
         self.pages.len
     }
+
+    /// Back the bytes of `self` with huge pages where they cover whole ones, if the system can.
+    ///
+    /// Only a hint: the system may ignore it (and does so on anything but Linux 6.1 and later, or
+    /// when it is short of contiguous memory,) or split the huge pages again later. The contents
+    /// and permissions of the pages stay the same.
+    pub(crate) fn collapse_huge_pages(&self) {
+        let raw = self.ptr.as_ptr() as usize;
+        let start = raw.next_multiple_of(HUGE_PAGE_SIZE);
+        let end = raw.saturating_add(self.len);
+        let end = end.saturating_sub(end.checked_rem(HUGE_PAGE_SIZE).unwrap_or(0));
+        if start >= end {
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            /// Not in `libc` for all the targets, but the same on all of them.
+            const MADV_COLLAPSE: libc::c_int = 25;
+            // SAFETY: `MADV_COLLAPSE` does not change the contents or the permissions of the
+            // pages, which `self` owns. It fails harmlessly where it is not supported, which is
+            // fine for a hint.
+            unsafe {
+                libc::madvise(
+                    start as *mut c_void,
+                    end.saturating_sub(start),
+                    MADV_COLLAPSE,
+                );
+            }
+        }
+    }
 }
 
 macro_rules! impl_many {
@@ -696,6 +734,10 @@ impl Pages {
         })
     }
 }
+
+/// The size of the huge pages that [`Mapping::collapse_huge_pages`] asks for: that of the
+/// smallest huge pages of x86_64 and of aarch64 with 4 KiB pages.
+pub(crate) const HUGE_PAGE_SIZE: usize = 2 * 1024 * 1024;
 
 pub(crate) fn get_system_page_size() -> usize {
     #[cfg(not(target_os = "windows"))]

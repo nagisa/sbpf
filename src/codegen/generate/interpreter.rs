@@ -2,7 +2,7 @@
 
 use super::{Generator, LabelRelocs, PatchFields, TemplateOpcode};
 use crate::codegen::arch::{self, SupportEntry, SupportingCode, TemplateRelocationKind};
-use crate::memory_management::{Mapping, ReadExecute};
+use crate::memory_management::{Mapping, ReadExecute, HUGE_PAGE_SIZE};
 use crate::program::SBPFVersion;
 use dynasmrt::relocations::{Relocation, RelocationKind};
 use dynasmrt::DynamicLabel;
@@ -72,12 +72,10 @@ impl InterpreterGenerator {
 
     fn new(version: SBPFVersion, mut buffer: Mapping) -> Self {
         let supports = SupportingCode::get();
-        assert_eq!(
-            buffer.len(),
-            Self::SUPPORTS.checked_add(supports.code.len()).unwrap()
-        );
+        let supports_end = Self::SUPPORTS.checked_add(supports.code.len()).unwrap();
+        assert!(buffer.len() >= supports_end);
         const { assert!(Self::SUPPORTS.is_multiple_of(arch::SUPPORTS_ALIGNMENT)) };
-        buffer[Self::SUPPORTS..].copy_from_slice(&supports.code);
+        buffer[Self::SUPPORTS..supports_end].copy_from_slice(&supports.code);
         Self {
             version,
             buffer,
@@ -224,6 +222,8 @@ fn generate_interpreter(version: SBPFVersion) -> Interpreter {
     #[cfg(feature = "codegen-debug")]
     let mut debug_image =
         super::super::debug::DebugImage::new(&format!("interpreter-{version:?}").to_lowercase());
+    // Whole huge pages, so that the supporting code after the steps is in one too.
+    let len = len.next_multiple_of(HUGE_PAGE_SIZE);
     let mut buffer = cfg_select! {
         feature = "codegen-debug" => debug_image.map_sub2g(len),
         _ => Mapping::sub2g(len),
@@ -265,6 +265,8 @@ fn generate_interpreter(version: SBPFVersion) -> Interpreter {
         #[cfg(feature = "codegen-debug")]
         step_lens: step_lens.into_boxed_slice(),
     };
+    // The steps of a program are spread over the whole table, too many 4 KiB pages for the TLB.
+    interpreter.steps.collapse_huge_pages();
     #[cfg(feature = "codegen-debug")]
     super::super::debug::finish_interpreter(debug_image, version, &interpreter);
     interpreter
