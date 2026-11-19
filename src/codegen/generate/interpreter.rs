@@ -7,6 +7,8 @@ use crate::memory_management::{Mapping, ReadExecute, HUGE_PAGE_SIZE};
 use crate::program::SBPFVersion;
 use dynasmrt::relocations::{Relocation, RelocationKind};
 use dynasmrt::DynamicLabel;
+use rand::{thread_rng, Rng};
+use std::convert::TryFrom;
 #[cfg(feature = "codegen-debug")]
 use std::convert::TryInto;
 use std::sync::LazyLock;
@@ -48,7 +50,7 @@ impl Interpreter {
 pub(in crate::codegen) struct InterpreterGenerator {
     buffer: Mapping,
     relocs: LabelRelocs<arch::Relocation>,
-    /// The offsets of the entries of the latest island.
+    /// The offsets of the entries of the island to use.
     island: Option<arch::IslandEntries>,
     /// The offsets of the entries of the supporting code.
     supports: arch::SupportEntries,
@@ -63,13 +65,42 @@ pub(in crate::codegen) struct InterpreterGenerator {
 
 impl InterpreterGenerator {
     pub(in crate::codegen) const STEP_SIZE_LOG2: u8 = arch::INTERPRETER_STEP_SIZE_LOG2;
-    pub(in crate::codegen) const STEP_TABLE_SIZE: usize = 0x1_0000 * (1 << Self::STEP_SIZE_LOG2);
+    /// The bits of the random part of [`Self::step_key`].
+    const STEP_KEY_BITS: u32 = 14;
+    /// The steps, in as many slots as [`Self::step_offset`] may spread them over.
+    pub(in crate::codegen) const STEP_TABLE_SIZE: usize =
+        (0x1_0000 + (0x1_0000 >> (15 - Self::STEP_KEY_BITS))) * (1 << Self::STEP_SIZE_LOG2);
     /// The offset of the supporting code, right after the steps.
     const SUPPORTS: usize = Self::STEP_TABLE_SIZE;
 
+    /// The key of the layout of the steps, random for each process, so that which steps share a
+    /// cache set differs between processes, see [`Self::step_offset`]: `1 << 15` plus a random
+    /// number below `1 << STEP_KEY_BITS`.
+    pub(in crate::codegen) fn step_key() -> u32 {
+        static KEY: LazyLock<u32> = LazyLock::new(|| {
+            0x8000 | thread_rng().gen_range(1..1 << InterpreterGenerator::STEP_KEY_BITS)
+        });
+        *KEY
+    }
+
+    /// How far the dispatch shifts the product of the opcode and [`Self::step_key`] to the right
+    /// and which bits it keeps of it, for the offset of the step, see [`Self::step_offset`].
+    pub(in crate::codegen) const STEP_OFFSET_SHIFT: i8 = 15 - Self::STEP_SIZE_LOG2 as i8;
+    pub(in crate::codegen) const STEP_OFFSET_MASK: i8 = -1 << Self::STEP_SIZE_LOG2;
+
     /// Offset into the `buffer` for this opcode.
+    ///
+    /// The slot of the step is the opcode multiplied with [`Self::step_key`], divided by `1 << 15`:
+    /// the opcode, plus the opcode times the random part of the key divided by `1 << 15`. As the
+    /// key is at least `1 << 15`, the slots of different opcodes differ, and the second part
+    /// carries the higher bits of the opcode into the low bits of the slot, which select the cache
+    /// set. The product fits in 32 bits, which the dispatch can multiply and shift without REX
+    /// prefixes. It does not take much for an adversary to pick many steps of the same set in a
+    /// known layout, which then evict each other from the cache all the time. With the key, they
+    /// cannot know which ones do. The machine code that dispatches to the steps does the same.
     pub(in crate::codegen) fn step_offset(opcode: TemplateOpcode) -> usize {
-        opcode.index() << Self::STEP_SIZE_LOG2
+        let slot = u32::from(opcode.0).checked_mul(Self::step_key()).unwrap() >> 15;
+        usize::try_from(slot).unwrap() << Self::STEP_SIZE_LOG2
     }
 
     /// The slot of the dispatch of the step for `opcode`, for when the step does not fit its own

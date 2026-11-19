@@ -352,7 +352,12 @@ impl SupportingCode {
 
             ; =>interpreted
             ; movzx RTEMP, WORD [rax]
-            ; shl RTEMP, InterpreterGenerator::STEP_SIZE_LOG2 as i8
+            // See `InterpreterGenerator::step_offset`. Rather than shifting the slot to the left by the step
+            // size after the shift to the right, clear the bits below it: Intel cores run the shifts on
+            // the same two ports as the branches.
+            ; imul WTEMP, WTEMP, InterpreterGenerator::step_key() as i32
+            ; shr WTEMP, InterpreterGenerator::STEP_OFFSET_SHIFT
+            ; and WTEMP, BYTE InterpreterGenerator::STEP_OFFSET_MASK
             ; add RTEMP, [BYTE frame!(code) + rbp]
             ; add RINSN, BYTE ebpf::INSN_SIZE as i8
 

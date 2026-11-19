@@ -744,7 +744,12 @@ pub(in crate::codegen) fn interpreter_dispatch(out: &mut InterpreterGenerator) {
         ; cmp RINSN, [BYTE frame!(text_section_limit) + rbp]
         ; jae BYTE =>exit
         ; movzx WTEMP, WORD [RINSN]
-        ; shl WTEMP, InterpreterGenerator::STEP_SIZE_LOG2 as i8
+        // See `InterpreterGenerator::step_offset`. Rather than shifting the slot to the left by the step
+        // size after the shift to the right, clear the bits below it: Intel cores run the shifts on
+        // the same two ports as the branches.
+        ; imul WTEMP, WTEMP, InterpreterGenerator::step_key() as i32
+        ; shr WTEMP, InterpreterGenerator::STEP_OFFSET_SHIFT
+        ; and WTEMP, BYTE InterpreterGenerator::STEP_OFFSET_MASK
         ; lea RTEMP, [ DWORD base_addr + RTEMP ]
         ; add RINSN, BYTE ebpf::INSN_SIZE as i8
         ; jmp RTEMP
