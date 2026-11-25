@@ -94,3 +94,7 @@ harness = false
 [[example]]
 name = "dynasm_tool"
 required-features = ["codegen-debug"]
+
+[[example]]
+name = "l1i_probe"
+required-features = ["codegen-debug"]
